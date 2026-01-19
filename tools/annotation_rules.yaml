@@ -1,0 +1,87 @@
+# 入叉面 OBB 标注规则配置
+version: "1.0"
+last_updated: "2026-01-18"
+
+# 标注目标定义
+target:
+  name: "fork_entry_surface"
+  description: "入叉面 - 包含两个叉孔开口所在的那一整块平面区域"
+  chinese_name: "入叉面"
+
+# OBB 规则
+obb_rules:
+  # 长边方向
+  long_edge_alignment: "horizontal"  # 沿入叉面水平边 (与地面平行)
+  
+  # 角度范围
+  angle_range:
+    min: 0
+    max: 90  # 不包含90°, YOLO OBB 标准
+    unit: "degrees"
+  
+  # 遮挡处理
+  occlusion:
+    strategy: "complete_plane"  # 按平面外接矩形补全
+    allow_extend_to_side: false  # 不允许外延到侧面
+
+# 质检规则
+quality_check:
+  # 必须包含叉孔特征
+  require_fork_hole_feature: true
+  fork_hole_visibility: "partial"  # 至少部分可见
+  
+  # 无叉孔特征的处理
+  no_feature_action: "mark_difficult"  # 标为困难样本
+  
+  # SAM3 质检阈值
+  sam3:
+    min_coverage: 0.5         # 框内 mask 覆盖率最低阈值
+    max_overflow: 0.3         # mask 超出框的最大比例
+    fork_hole_weight: 0.5     # 叉孔特征权重
+
+# 置信度分桶
+confidence_buckets:
+  auto_accept:
+    threshold: 0.85
+    action: "直接收录"
+    output_dir: "auto_accept"
+  manual_review:
+    threshold: 0.5
+    action: "人工快修"
+    output_dir: "manual_review"
+  reject:
+    threshold: 0.3
+    action: "抽样少量人工标"
+    output_dir: "reject_samples"
+    sample_rate: 0.1  # 10% 抽样
+
+# 扩标策略 (主动学习)
+active_learning:
+  priority_samples:
+    - type: "angle_large"
+      description: "角度大 (>30°)"
+    - type: "distance_far"
+      description: "距离远 (>5m)"
+    - type: "lighting_poor"
+      description: "光照差"
+    - type: "occlusion_partial"
+      description: "局部遮挡 (入叉面仍可见但不清晰)"
+  
+  validation:
+    fixed_set: true       # 保留固定验证集
+    metrics:
+      - name: "angle_error"
+        description: "角度误差 (degrees)"
+        weight: 0.4
+      - name: "center_offset"
+        description: "中心偏移误差 (normalized)"
+        weight: 0.4
+      - name: "mAP"
+        description: "常规 mAP 指标"
+        weight: 0.2
+
+# 类别定义
+classes:
+  0:
+    name: "fork_entry_surface"
+    description: "入叉面"
