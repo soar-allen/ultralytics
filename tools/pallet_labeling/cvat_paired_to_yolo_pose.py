@@ -4,9 +4,10 @@
 将 CVAT XML 中配对的 bbox + polygon 标注转换为 YOLO-Pose 训练数据。
 
 输入：经过 CVAT 二次确认的 XML 文件，包含：
-  - pallet (box): 整个托盘的 bounding box
-  - pallet_front (polygon): 前表面 4 点多边形
+  - pallet_body (box): 整个托盘的 bounding box
+  - pallet (polygon): 前表面 4 点多边形
   两者通过 group_id 关联为一组
+  - pallet_partial (box, 可选): 不完整托盘，仅 bbox，无关键点
 
 输出：
   out_dir/
@@ -16,9 +17,10 @@
 
 YOLO-Pose 标签行格式（kpt_shape=[4,3]）：
   cls xc yc w h  x1 y1 v1  x2 y2 v2  x3 y3 v3  x4 y4 v4
-  - bbox (xc yc w h) 来自 pallet box 标注
-  - 关键点 (x y v) 来自 pallet_front polygon 的 4 个顶点（tl, tr, br, bl）
+  - bbox (xc yc w h) 来自 pallet_body box 标注
+  - 关键点 (x y v) 来自 pallet polygon 的 4 个顶点（tl, tr, br, bl）
   - 所有坐标 0~1 归一化，v=2 表示可见
+  - pallet_partial: cls=1, 关键点全为 0 0 0（不可见）
 
 用法：
   python tools/pallet_labeling/cvat_paired_to_yolo_pose.py \
@@ -68,12 +70,22 @@ class PairedAnnotation:
     polygon_points: list[tuple[float, float]]
 
 
+@dataclass(frozen=True)
+class PartialAnnotation:
+    """不完整托盘标注：仅 bbox，无关键点。"""
+    bbox_xtl: float
+    bbox_ytl: float
+    bbox_xbr: float
+    bbox_ybr: float
+
+
 @dataclass
 class ImageData:
     name: str
     width: int
     height: int
     pairs: list[PairedAnnotation] = field(default_factory=list)
+    partials: list[PartialAnnotation] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -109,8 +121,12 @@ def parse_paired_cvat_xml(
     xml_path: Path,
     bbox_label: str = "pallet",
     polygon_label: str = "pallet_front",
+    partial_label: str | None = None,
 ) -> list[ImageData]:
-    """解析含有配对标注的 CVAT XML，按 group_id 关联 bbox 与 polygon。"""
+    """解析含有配对标注的 CVAT XML，按 group_id 关联 bbox 与 polygon。
+
+    当指定 partial_label 时，同时提取该标签的独立 box（无关键点）。
+    """
     tree = ET.parse(str(xml_path))
     root = tree.getroot()
 
@@ -123,19 +139,27 @@ def parse_paired_cvat_xml(
 
         boxes_by_group: dict[int, dict[str, float]] = {}
         polys_by_group: dict[int, list[tuple[float, float]]] = {}
+        partials: list[PartialAnnotation] = []
 
         for box_el in img_el.findall("box"):
-            if box_el.get("label") != bbox_label:
-                continue
-            gid = int(box_el.get("group_id", "0"))
-            if gid == 0:
-                continue
-            boxes_by_group[gid] = {
-                "xtl": float(box_el.get("xtl", "0")),
-                "ytl": float(box_el.get("ytl", "0")),
-                "xbr": float(box_el.get("xbr", "0")),
-                "ybr": float(box_el.get("ybr", "0")),
-            }
+            label = box_el.get("label", "")
+            if label == bbox_label:
+                gid = int(box_el.get("group_id", "0"))
+                if gid == 0:
+                    continue
+                boxes_by_group[gid] = {
+                    "xtl": float(box_el.get("xtl", "0")),
+                    "ytl": float(box_el.get("ytl", "0")),
+                    "xbr": float(box_el.get("xbr", "0")),
+                    "ybr": float(box_el.get("ybr", "0")),
+                }
+            elif partial_label and label == partial_label:
+                partials.append(PartialAnnotation(
+                    bbox_xtl=float(box_el.get("xtl", "0")),
+                    bbox_ytl=float(box_el.get("ytl", "0")),
+                    bbox_xbr=float(box_el.get("xbr", "0")),
+                    bbox_ybr=float(box_el.get("ybr", "0")),
+                ))
 
         for poly_el in img_el.findall("polygon"):
             if poly_el.get("label") != polygon_label:
@@ -152,13 +176,11 @@ def parse_paired_cvat_xml(
             if len(pts) == 4:
                 polys_by_group[gid] = pts
 
-        # group_id=0 无法匹配的，尝试按空间关系 fallback
         unmatched_boxes = {gid: b for gid, b in boxes_by_group.items()
                           if gid not in polys_by_group}
         unmatched_polys = {gid: p for gid, p in polys_by_group.items()
                           if gid not in boxes_by_group}
 
-        # 先收集 group_id 匹配的
         pairs: list[PairedAnnotation] = []
         for gid in sorted(set(boxes_by_group.keys()) & set(polys_by_group.keys())):
             box = boxes_by_group[gid]
@@ -170,7 +192,6 @@ def parse_paired_cvat_xml(
                 polygon_points=ordered,
             ))
 
-        # fallback: 如果有未匹配的 box 和 polygon，按 polygon 中心是否在 box 内匹配
         if unmatched_boxes and unmatched_polys:
             used_poly_gids: set[int] = set()
             for _bgid, box in unmatched_boxes.items():
@@ -197,8 +218,11 @@ def parse_paired_cvat_xml(
                         polygon_points=ordered,
                     ))
 
-        if pairs:
-            result.append(ImageData(name=name, width=width, height=height, pairs=pairs))
+        if pairs or partials:
+            result.append(ImageData(
+                name=name, width=width, height=height,
+                pairs=pairs, partials=partials,
+            ))
 
     return result
 
@@ -263,12 +287,20 @@ def export_yolo_pose(
     *,
     cls_id: int = 0,
     class_name: str = "pallet",
+    partial_cls_id: int | None = None,
+    partial_class_name: str | None = None,
     split_ratio: tuple[float, float, float] = (0.9, 0.1, 0.0),
     seed: int = 42,
     copy_images: bool = False,
     skip_images: bool = False,
 ) -> None:
-    """将配对标注导出为 YOLO-Pose 数据集。"""
+    """将配对标注导出为 YOLO-Pose 数据集。
+
+    当指定 partial_cls_id / partial_class_name 时，同时导出不完整托盘
+    （仅 bbox，关键点全部设为 0,0,0）。
+    """
+    has_partials = partial_cls_id is not None and any(item.partials for item in data_list)
+
     tr, va, te = split_ratio
     rng = random.Random(seed)
     indices = list(range(len(data_list)))
@@ -282,6 +314,9 @@ def export_yolo_pose(
         "val": [data_list[i] for i in indices[n_tr:n_tr + n_va]],
         "test": [data_list[i] for i in indices[n_tr + n_va:]],
     }
+
+    n_kpts = 4
+    dummy_kpts: list[tuple[float, float]] = [(0.0, 0.0)] * n_kpts
 
     for sp, items in split_map.items():
         if not items:
@@ -301,6 +336,16 @@ def export_yolo_pose(
                 line = _pose_line(cls_id, bbox, pair.polygon_points, item.width, item.height)
                 lines.append(line)
 
+            if has_partials:
+                for partial in item.partials:
+                    bbox = (partial.bbox_xtl, partial.bbox_ytl,
+                            partial.bbox_xbr, partial.bbox_ybr)
+                    line = _pose_line(
+                        partial_cls_id, bbox, dummy_kpts,
+                        item.width, item.height, visibility=0,
+                    )
+                    lines.append(line)
+
             label_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
             if not skip_images and images_dir is not None:
@@ -309,12 +354,16 @@ def export_yolo_pose(
                     img_dst = images_out_dir / basename
                     _link_or_copy(img_src, img_dst, copy_mode=copy_images)
 
+    names: dict[int, str] = {cls_id: class_name}
+    if has_partials and partial_cls_id is not None and partial_class_name:
+        names[partial_cls_id] = partial_class_name
+
     data_yaml = {
         "path": str(out_dir.resolve()),
         "train": "images/train",
         "val": "images/val",
         "test": "images/test",
-        "names": [class_name],
+        "names": names,
         "kpt_shape": [4, 3],
         "flip_idx": [1, 0, 3, 2],
     }
@@ -327,12 +376,21 @@ def export_yolo_pose(
     print(f"\nYOLO-Pose 数据集已生成: {out_dir}")
     print(f"  data.yaml: {yaml_path}")
     total_pairs = 0
+    total_partials = 0
     for sp, items in split_map.items():
         if items:
             sp_pairs = sum(len(it.pairs) for it in items)
+            sp_partials = sum(len(it.partials) for it in items)
             total_pairs += sp_pairs
-            print(f"  {sp}: {len(items)} 张图片, {sp_pairs} 组标注")
-    print(f"  总计: {len(data_list)} 张图片, {total_pairs} 组标注")
+            total_partials += sp_partials
+            parts = [f"{sp_pairs} 配对"]
+            if sp_partials > 0:
+                parts.append(f"{sp_partials} partial")
+            print(f"  {sp}: {len(items)} 张图片, {', '.join(parts)}")
+    summary = [f"{total_pairs} 配对标注"]
+    if total_partials > 0:
+        summary.append(f"{total_partials} partial 标注")
+    print(f"  总计: {len(data_list)} 张图片, {', '.join(summary)}")
 
 
 # ---------------------------------------------------------------------------
@@ -353,10 +411,16 @@ def main() -> int:
                     help="CVAT 中 bbox 的标签名（默认 pallet_body）")
     ap.add_argument("--polygon_label", type=str, default="pallet",
                     help="CVAT 中 polygon 的标签名（默认 pallet）")
+    ap.add_argument("--partial_label", type=str, default=None,
+                    help="CVAT 中不完整托盘 bbox 标签名（如 pallet_partial，默认不处理）")
     ap.add_argument("--class_name", type=str, default="pallet",
                     help="YOLO 输出类别名（默认 pallet）")
+    ap.add_argument("--partial_class_name", type=str, default="pallet_partial",
+                    help="YOLO 输出不完整托盘类别名（默认 pallet_partial）")
     ap.add_argument("--cls_id", type=int, default=0,
                     help="YOLO 类别 ID（默认 0）")
+    ap.add_argument("--partial_cls_id", type=int, default=1,
+                    help="不完整托盘 YOLO 类别 ID（默认 1）")
     ap.add_argument("--split", type=str, default="0.9,0.1,0.0",
                     help="train,val,test 划分比例（默认 0.9,0.1,0.0）")
     ap.add_argument("--seed", type=int, default=42,
@@ -376,12 +440,19 @@ def main() -> int:
         return 1
 
     print(f"解析 CVAT XML: {cvat_path}")
-    data = parse_paired_cvat_xml(cvat_path, args.bbox_label, args.polygon_label)
+    data = parse_paired_cvat_xml(
+        cvat_path, args.bbox_label, args.polygon_label,
+        partial_label=args.partial_label,
+    )
     total_pairs = sum(len(d.pairs) for d in data)
-    print(f"  有效图片数: {len(data)}, 配对标注数: {total_pairs}")
+    total_partials = sum(len(d.partials) for d in data)
+    parts = [f"配对标注数: {total_pairs}"]
+    if total_partials > 0:
+        parts.append(f"partial 标注数: {total_partials}")
+    print(f"  有效图片数: {len(data)}, {', '.join(parts)}")
 
     if not data:
-        print("[ERROR] 未找到有效的配对标注（检查标签名和 group_id 是否正确）")
+        print("[ERROR] 未找到有效的标注（检查标签名和 group_id 是否正确）")
         return 1
 
     tr, va, te = [float(x) for x in args.split.split(",")]
@@ -395,6 +466,8 @@ def main() -> int:
         images_dir,
         cls_id=args.cls_id,
         class_name=args.class_name,
+        partial_cls_id=args.partial_cls_id if args.partial_label else None,
+        partial_class_name=args.partial_class_name if args.partial_label else None,
         split_ratio=(tr, va, te),
         seed=args.seed,
         copy_images=args.copy_images,

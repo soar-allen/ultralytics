@@ -1,0 +1,786 @@
+"""
+多格式导出模块。
+
+支持导出格式：
+  - YOLO Detect  (纯框)
+  - YOLO Pose    (关键点)
+  - YOLO OBB     (旋转框)
+
+特性：
+  - 按类别过滤导出
+  - 只导出有标签的图像
+  - 自动生成 data.yaml
+  - 支持按比例划分 train/valid/test
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import shutil
+import yaml
+from pathlib import Path
+from typing import Optional, Union
+
+import cv2
+import fiftyone as fo
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+SplitsType = Union[str, dict[str, float]]
+
+
+# ===================================================================
+# 内部工具
+# ===================================================================
+
+def _ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _get_labeled_view(
+    ds: fo.Dataset | fo.DatasetView,
+    label_field: str,
+    classes: Optional[list[str]] = None,
+) -> fo.DatasetView:
+    """获取有标注的视图，可选按类别过滤。"""
+    from fiftyone import ViewField as F
+
+    schema = ds.get_field_schema()
+    if label_field not in schema:
+        raise ValueError(f"字段 '{label_field}' 不存在于数据集中")
+
+    field = schema[label_field]
+    if hasattr(field, 'document_type') and field.document_type:
+        if issubclass(field.document_type, fo.Detections):
+            sub = f"{label_field}.detections"
+        elif issubclass(field.document_type, fo.Keypoints):
+            sub = f"{label_field}.keypoints"
+        elif issubclass(field.document_type, fo.Polylines):
+            sub = f"{label_field}.polylines"
+        else:
+            sub = label_field
+    else:
+        sub = label_field
+
+    view = ds.match(F(sub).length() > 0)
+
+    if classes:
+        view = view.filter_labels(label_field, F("label").is_in(classes))
+        view = view.match(F(sub).length() > 0)
+
+    return view
+
+
+def _build_class_map(
+    ds: fo.Dataset | fo.DatasetView,
+    label_field: str,
+    classes: Optional[list[str]] = None,
+) -> dict[str, int]:
+    """构建 class_name -> class_id 映射。"""
+    schema = ds.get_field_schema()
+    if label_field not in schema:
+        return {}
+
+    field = schema[label_field]
+    if hasattr(field, 'document_type') and field.document_type:
+        if issubclass(field.document_type, fo.Detections):
+            raw = ds.distinct(f"{label_field}.detections.label")
+        elif issubclass(field.document_type, fo.Keypoints):
+            raw = ds.distinct(f"{label_field}.keypoints.label")
+        elif issubclass(field.document_type, fo.Polylines):
+            raw = ds.distinct(f"{label_field}.polylines.label")
+        else:
+            raw = []
+    else:
+        raw = []
+
+    all_classes = sorted(c for c in raw if c is not None)
+
+    if classes:
+        all_classes = [c for c in all_classes if c in classes]
+
+    return {name: idx for idx, name in enumerate(all_classes)}
+
+
+def _write_data_yaml(
+    output_dir: Path,
+    class_map: dict[str, int],
+    splits: list[str],
+) -> None:
+    """生成 data.yaml 配置文件。"""
+    _ensure_dir(output_dir)
+    names = {v: k for k, v in class_map.items()}
+    data = {
+        "path": str(output_dir),
+        "names": names,
+        "nc": len(class_map),
+    }
+    for split in splits:
+        data[split] = f"{split}/images"
+
+    with open(output_dir / "data.yaml", "w") as f:
+        yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+
+
+def _resolve_splits(
+    view: fo.DatasetView,
+    splits: SplitsType,
+    seed: int = 42,
+) -> dict[str, list[str]]:
+    """
+    将 splits 参数解析为 {split_name: [sample_ids]} 映射。
+
+    splits 可以是：
+      - str: 所有样本归入该 split（如 "train"）
+      - dict[str, float]: 按比例随机划分（如 {"train": 0.8, "valid": 0.1, "test": 0.1}）
+    """
+    ids = list(view.values("id"))
+    if isinstance(splits, str):
+        return {splits: ids}
+
+    rng = random.Random(seed)
+    rng.shuffle(ids)
+    n = len(ids)
+    result: dict[str, list[str]] = {}
+    offset = 0
+    split_names = list(splits.keys())
+    for i, name in enumerate(split_names):
+        if i == len(split_names) - 1:
+            result[name] = ids[offset:]
+        else:
+            count = round(n * splits[name])
+            result[name] = ids[offset : offset + count]
+            offset += count
+    return result
+
+
+_YOLO_SPLIT_NAMES = {"valid": "val"}
+
+
+def _normalize_split_ids(
+    split_ids: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """将 split 名称映射为 YOLO 惯例（valid → val）。"""
+    return {_YOLO_SPLIT_NAMES.get(k, k): v for k, v in split_ids.items()}
+
+
+def _copy_image(src: str | Path, dst_dir: Path) -> str:
+    """复制图片到目标目录，返回文件名。"""
+    src = Path(src)
+    dst = dst_dir / src.name
+    if dst.exists():
+        stem, ext = src.stem, src.suffix
+        n = 2
+        while (dst_dir / f"{stem}_{n}{ext}").exists():
+            n += 1
+        dst = dst_dir / f"{stem}_{n}{ext}"
+    shutil.copy2(src, dst)
+    return dst.name
+
+
+# ===================================================================
+# YOLO Detect 导出
+# ===================================================================
+
+def export_yolo_detect(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: str | Path,
+    label_field: str = "ground_truth",
+    classes: Optional[list[str]] = None,
+    splits: SplitsType = "train",
+) -> dict:
+    """
+    导出 YOLO Detect 格式（纯框）。
+
+    Args:
+        splits: "train" 全部导入单 split，或 {"train": 0.8, "valid": 0.1, "test": 0.1} 按比例划分。
+    """
+    output_dir = Path(output_dir).resolve()
+    view = _get_labeled_view(ds, label_field, classes)
+    class_map = _build_class_map(ds, label_field, classes)
+
+    if not class_map:
+        logger.warning("无可导出的类别")
+        return {"exported": 0}
+
+    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    all_split_names = list(split_ids.keys())
+    _write_data_yaml(output_dir, class_map, all_split_names)
+
+    total = 0
+    per_split = {}
+    for split_name, ids in split_ids.items():
+        if not ids:
+            per_split[split_name] = 0
+            continue
+        img_dir = _ensure_dir(output_dir / split_name / "images")
+        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
+        sub_view = view.select(ids)
+
+        count = 0
+        for sample in sub_view.iter_samples(progress=True):
+            label_data = sample[label_field]
+            if label_data is None:
+                continue
+            detections = label_data.detections
+            if not detections:
+                continue
+
+            fname = _copy_image(sample.filepath, img_dir)
+            stem = Path(fname).stem
+
+            lines = []
+            for det in detections:
+                if classes and det.label not in classes:
+                    continue
+                if det.label not in class_map:
+                    continue
+                cls_id = class_map[det.label]
+                x, y, w, h = det.bounding_box
+                cx = x + w / 2
+                cy = y + h / 2
+                lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+
+            if lines:
+                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                count += 1
+
+        per_split[split_name] = count
+        total += count
+
+    logger.info("YOLO Detect 导出: %d 张图片, %d 个类别", total, len(class_map))
+    return {"exported": total, "per_split": per_split, "classes": list(class_map.keys()), "output_dir": str(output_dir)}
+
+
+export_yolov8_detect = export_yolo_detect
+
+
+# ===================================================================
+# YOLO Pose 导出
+# ===================================================================
+
+def export_yolo_pose(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: str | Path,
+    det_field: str = "ground_truth",
+    kp_field: str = "ground_truth_keypoints",
+    classes: Optional[list[str]] = None,
+    splits: SplitsType = "train",
+    num_keypoints: Optional[int] = None,
+) -> dict:
+    """
+    导出 YOLO Pose 格式（关键点）。
+
+    每行格式: class_id cx cy w h kx1 ky1 kv1 kx2 ky2 kv2 ...
+    """
+    output_dir = Path(output_dir).resolve()
+
+    has_kp = kp_field in ds.get_field_schema()
+    has_det = det_field in ds.get_field_schema()
+
+    if not has_kp:
+        logger.warning("关键点字段 '%s' 不存在", kp_field)
+        return {"exported": 0}
+
+    from fiftyone import ViewField as F
+    view = ds.match(F(f"{kp_field}.keypoints").length() > 0)
+    if classes:
+        view = view.filter_labels(kp_field, F("label").is_in(classes))
+        view = view.match(F(f"{kp_field}.keypoints").length() > 0)
+
+    class_map = _build_class_map(ds, kp_field, classes)
+    if not class_map:
+        all_kp_classes = sorted(c for c in ds.distinct(f"{kp_field}.keypoints.label") if c is not None)
+        if classes:
+            all_kp_classes = [c for c in all_kp_classes if c in classes]
+        class_map = {name: idx for idx, name in enumerate(all_kp_classes)}
+
+    if not class_map:
+        return {"exported": 0}
+
+    if num_keypoints is None:
+        for sample in view.head(10):
+            kps = sample[kp_field]
+            if kps and kps.keypoints:
+                num_keypoints = len(kps.keypoints[0].points)
+                break
+        if num_keypoints is None:
+            num_keypoints = 0
+
+    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    all_split_names = list(split_ids.keys())
+
+    _ensure_dir(output_dir)
+    data_yaml = {
+        "path": str(output_dir),
+        "names": {v: k for k, v in class_map.items()},
+        "nc": len(class_map),
+        "kpt_shape": [num_keypoints, 3],
+    }
+    for sn in all_split_names:
+        data_yaml[sn] = f"{sn}/images"
+    with open(output_dir / "data.yaml", "w") as f:
+        yaml.dump(data_yaml, f, default_flow_style=False, allow_unicode=True)
+
+    total = 0
+    per_split = {}
+    for split_name, ids in split_ids.items():
+        if not ids:
+            per_split[split_name] = 0
+            continue
+        img_dir = _ensure_dir(output_dir / split_name / "images")
+        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
+        sub_view = view.select(ids)
+
+        count = 0
+        for sample in sub_view.iter_samples(progress=True):
+            kps_data = sample[kp_field]
+            if kps_data is None or not kps_data.keypoints:
+                continue
+
+            det_data = sample[det_field] if has_det and sample[det_field] else None
+            det_map: dict[str, list] = {}
+            if det_data:
+                for det in det_data.detections:
+                    det_map.setdefault(det.label, []).append(det.bounding_box)
+
+            fname = _copy_image(sample.filepath, img_dir)
+            stem = Path(fname).stem
+
+            lines = []
+            for kp in kps_data.keypoints:
+                if classes and kp.label not in classes:
+                    continue
+                if kp.label not in class_map:
+                    continue
+                cls_id = class_map[kp.label]
+
+                bboxes = det_map.get(kp.label, [])
+                if bboxes:
+                    bbox = bboxes.pop(0)
+                    x, y, w, h = bbox
+                else:
+                    xs = [p[0] for p in kp.points if p[0] > 0]
+                    ys = [p[1] for p in kp.points if p[1] > 0]
+                    if xs and ys:
+                        x_min, x_max = min(xs), max(xs)
+                        y_min, y_max = min(ys), max(ys)
+                        margin = 0.02
+                        x = max(0, x_min - margin)
+                        y = max(0, y_min - margin)
+                        w = min(1, x_max - x_min + 2 * margin)
+                        h = min(1, y_max - y_min + 2 * margin)
+                    else:
+                        continue
+
+                cx = x + w / 2
+                cy = y + h / 2
+                parts = [f"{cls_id}", f"{cx:.6f}", f"{cy:.6f}", f"{w:.6f}", f"{h:.6f}"]
+
+                for pi, pt in enumerate(kp.points):
+                    kx, ky = pt[0], pt[1]
+                    if kp.confidence and pi < len(kp.confidence):
+                        kv = kp.confidence[pi]
+                    else:
+                        kv = 2.0
+                    parts.extend([f"{kx:.6f}", f"{ky:.6f}", f"{kv:.0f}"])
+
+                lines.append(" ".join(parts))
+
+            if lines:
+                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                count += 1
+
+        per_split[split_name] = count
+        total += count
+
+    logger.info("YOLO Pose 导出: %d 张图片", total)
+    return {"exported": total, "per_split": per_split, "classes": list(class_map.keys()), "num_keypoints": num_keypoints}
+
+
+export_yolov8_pose = export_yolo_pose
+
+
+# ===================================================================
+# YOLO Pose 导出（从四边形 Polylines 转换）
+# ===================================================================
+
+def _order_quad_tl_tr_br_bl(
+    pts: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """将 4 点排序为 [tl, tr, br, bl]（左上、右上、右下、左下）。"""
+    arr = np.array(pts, dtype=np.float64)
+    s = arr.sum(axis=1)       # x+y 最小 → 左上, 最大 → 右下
+    d = arr[:, 0] - arr[:, 1]  # x-y 最大 → 右上, 最小 → 左下
+    tl = arr[int(np.argmin(s))]
+    br = arr[int(np.argmax(s))]
+    tr = arr[int(np.argmax(d))]
+    bl = arr[int(np.argmin(d))]
+    return [
+        (float(tl[0]), float(tl[1])),
+        (float(tr[0]), float(tr[1])),
+        (float(br[0]), float(br[1])),
+        (float(bl[0]), float(bl[1])),
+    ]
+
+
+def _compute_kpt_visibility(
+    norm_pts: list[tuple[float, float]],
+    img_w: int,
+    img_h: int,
+    edge_threshold: float = 5.0,
+) -> list[int]:
+    """根据关键点到图像边界的距离计算可见性。
+
+    Returns:
+        visibility 列表：2=可见, 0=不可见（贴近边界，坐标将归零）
+    """
+    result: list[int] = []
+    for nx, ny in norm_pts:
+        px, py = nx * img_w, ny * img_h
+        min_dist = min(px, img_w - px, py, img_h - py)
+        result.append(0 if min_dist < edge_threshold else 2)
+    return result
+
+
+def _get_image_dims(sample) -> tuple[int, int]:
+    """获取样本图片尺寸 (width, height)，优先用 metadata，降级读文件。"""
+    if sample.metadata and hasattr(sample.metadata, "width"):
+        return sample.metadata.width, sample.metadata.height
+    try:
+        img = cv2.imread(sample.filepath)
+        if img is not None:
+            h, w = img.shape[:2]
+            return w, h
+    except Exception:
+        pass
+    return 0, 0
+
+
+def export_yolo_pose_from_polylines(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: str | Path,
+    label_field: str = "ground_truth_polylines",
+    classes: Optional[list[str]] = None,
+    splits: SplitsType = "train",
+    edge_threshold: float = 5.0,
+    bbox_margin: float = 0.0,
+) -> dict:
+    """
+    从四边形 Polylines 导出 YOLO Pose 格式。
+
+    将每个 4 点多边形转换为：
+      - 关键点：tl, tr, br, bl（自动排序）
+      - 包围框：从 polygon 顶点直接计算（bbox_margin>0 时外扩）
+      - 可见性：距图像边界 < edge_threshold 像素 → v=0 坐标归零（不可见），否则 v=2（可见）
+
+    Args:
+        label_field: Polylines 类型的标签字段名
+        edge_threshold: 关键点距图像边界小于此像素值时标记为不可见（默认 5.0）
+        bbox_margin: 包围框外扩的归一化边距（默认 0.0 不外扩）
+        splits: 同其他导出函数，支持 str 或 dict 比例划分
+
+    输出 YOLO-Pose 行格式 (kpt_shape=[4,3]):
+        cls_id cx cy w h  x1 y1 v1  x2 y2 v2  x3 y3 v3  x4 y4 v4
+        v=2 可见 | v=0 不可见（坐标归零）
+    """
+    output_dir = Path(output_dir).resolve()
+
+    from fiftyone import ViewField as F
+    view = ds.match(F(f"{label_field}.polylines").length() > 0)
+    if classes:
+        view = view.filter_labels(label_field, F("label").is_in(classes))
+        view = view.match(F(f"{label_field}.polylines").length() > 0)
+
+    all_classes = sorted(c for c in ds.distinct(f"{label_field}.polylines.label") if c is not None)
+    if classes:
+        all_classes = [c for c in all_classes if c in classes]
+    class_map = {name: idx for idx, name in enumerate(all_classes)}
+
+    if not class_map:
+        logger.warning("无可导出的类别")
+        return {"exported": 0}
+
+    try:
+        view.compute_metadata(overwrite=False)
+    except Exception:
+        logger.info("compute_metadata 跳过，将从图片文件读取尺寸")
+
+    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    all_split_names = list(split_ids.keys())
+
+    _ensure_dir(output_dir)
+    data_yaml = {
+        "path": str(output_dir),
+        "names": {v: k for k, v in class_map.items()},
+        "nc": len(class_map),
+        "kpt_shape": [4, 3],
+        "flip_idx": [1, 0, 3, 2],
+    }
+    for sn in all_split_names:
+        data_yaml[sn] = f"{sn}/images"
+    with open(output_dir / "data.yaml", "w") as f:
+        yaml.dump(data_yaml, f, default_flow_style=False, allow_unicode=True)
+
+    total = 0
+    total_occluded_kpts = 0
+    per_split: dict[str, int] = {}
+
+    for split_name, ids in split_ids.items():
+        if not ids:
+            per_split[split_name] = 0
+            continue
+        img_dir = _ensure_dir(output_dir / split_name / "images")
+        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
+        sub_view = view.select(ids)
+
+        count = 0
+        for sample in sub_view.iter_samples(progress=True):
+            poly_data = sample[label_field]
+            if poly_data is None or not poly_data.polylines:
+                continue
+
+            img_w, img_h = _get_image_dims(sample)
+            if img_w <= 0 or img_h <= 0:
+                logger.warning("无法获取图片尺寸: %s", sample.filepath)
+                continue
+
+            fname = _copy_image(sample.filepath, img_dir)
+            stem = Path(fname).stem
+            lines: list[str] = []
+
+            for poly in poly_data.polylines:
+                if classes and poly.label not in classes:
+                    continue
+                if poly.label not in class_map:
+                    continue
+
+                pts = poly.points[0] if poly.points else []
+                if len(pts) != 4:
+                    continue
+
+                cls_id = class_map[poly.label]
+                ordered = _order_quad_tl_tr_br_bl(pts)
+                vis = _compute_kpt_visibility(ordered, img_w, img_h, edge_threshold)
+                total_occluded_kpts += sum(1 for v in vis if v == 0)
+
+                xs = [p[0] for p in ordered]
+                ys = [p[1] for p in ordered]
+                x_min = max(0.0, min(xs) - bbox_margin)
+                y_min = max(0.0, min(ys) - bbox_margin)
+                x_max = min(1.0, max(xs) + bbox_margin)
+                y_max = min(1.0, max(ys) + bbox_margin)
+                bw = x_max - x_min
+                bh = y_max - y_min
+                cx = (x_min + x_max) / 2
+                cy = (y_min + y_max) / 2
+
+                parts = [f"{cls_id}", f"{cx:.6f}", f"{cy:.6f}", f"{bw:.6f}", f"{bh:.6f}"]
+                for (kx, ky), kv in zip(ordered, vis):
+                    if kv == 0:
+                        parts.extend(["0.000000", "0.000000", "0"])
+                    else:
+                        parts.extend([f"{kx:.6f}", f"{ky:.6f}", f"{kv}"])
+                lines.append(" ".join(parts))
+
+            if lines:
+                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                count += 1
+
+        per_split[split_name] = count
+        total += count
+
+    logger.info("YOLO Pose (from polylines) 导出: %d 张图片, occluded 关键点: %d", total, total_occluded_kpts)
+    return {
+        "exported": total,
+        "per_split": per_split,
+        "classes": list(class_map.keys()),
+        "kpt_shape": [4, 3],
+        "occluded_keypoints": total_occluded_kpts,
+        "output_dir": str(output_dir),
+    }
+
+
+# ===================================================================
+# YOLO OBB 导出
+# ===================================================================
+
+def export_yolo_obb(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: str | Path,
+    label_field: str = "ground_truth",
+    obb_field: Optional[str] = None,
+    classes: Optional[list[str]] = None,
+    splits: SplitsType = "train",
+) -> dict:
+    """
+    导出 YOLO OBB 格式（旋转框）。
+
+    每行格式: class_id x1 y1 x2 y2 x3 y3 x4 y4
+    顶点为归一化坐标。
+
+    如果提供 obb_field（Polylines 字段），从中提取四边形顶点。
+    否则从 label_field（Detections 字段）中构造，使用 rotation 属性。
+    """
+    output_dir = Path(output_dir).resolve()
+
+    if obb_field and obb_field in ds.get_field_schema():
+        return _export_obb_from_polylines(ds, output_dir, obb_field, classes, splits)
+    else:
+        return _export_obb_from_detections(ds, output_dir, label_field, classes, splits)
+
+
+export_yolov8_obb = export_yolo_obb
+
+
+def _export_obb_from_polylines(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: Path,
+    obb_field: str,
+    classes: Optional[list[str]],
+    splits: SplitsType,
+) -> dict:
+    from fiftyone import ViewField as F
+    view = ds.match(F(f"{obb_field}.polylines").length() > 0)
+    if classes:
+        view = view.filter_labels(obb_field, F("label").is_in(classes))
+        view = view.match(F(f"{obb_field}.polylines").length() > 0)
+
+    all_classes = sorted(c for c in ds.distinct(f"{obb_field}.polylines.label") if c is not None)
+    if classes:
+        all_classes = [c for c in all_classes if c in classes]
+    class_map = {name: idx for idx, name in enumerate(all_classes)}
+
+    if not class_map:
+        return {"exported": 0}
+
+    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    all_split_names = list(split_ids.keys())
+    _write_data_yaml(output_dir, class_map, all_split_names)
+
+    total = 0
+    per_split = {}
+    for split_name, ids in split_ids.items():
+        if not ids:
+            per_split[split_name] = 0
+            continue
+        img_dir = _ensure_dir(output_dir / split_name / "images")
+        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
+        sub_view = view.select(ids)
+
+        count = 0
+        for sample in sub_view.iter_samples(progress=True):
+            poly_data = sample[obb_field]
+            if poly_data is None or not poly_data.polylines:
+                continue
+
+            fname = _copy_image(sample.filepath, img_dir)
+            stem = Path(fname).stem
+            lines = []
+
+            for poly in poly_data.polylines:
+                if classes and poly.label not in classes:
+                    continue
+                if poly.label not in class_map:
+                    continue
+
+                pts = poly.points[0] if poly.points else []
+                if len(pts) != 4:
+                    continue
+
+                cls_id = class_map[poly.label]
+                coords = []
+                for pt in pts:
+                    coords.extend([f"{pt[0]:.6f}", f"{pt[1]:.6f}"])
+                lines.append(f"{cls_id} " + " ".join(coords))
+
+            if lines:
+                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                count += 1
+
+        per_split[split_name] = count
+        total += count
+
+    return {"exported": total, "per_split": per_split, "classes": list(class_map.keys())}
+
+
+def _export_obb_from_detections(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: Path,
+    label_field: str,
+    classes: Optional[list[str]],
+    splits: SplitsType,
+) -> dict:
+    """从 Detections 字段（带 rotation 属性）导出 OBB 格式。"""
+    view = _get_labeled_view(ds, label_field, classes)
+    class_map = _build_class_map(ds, label_field, classes)
+
+    if not class_map:
+        return {"exported": 0}
+
+    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    all_split_names = list(split_ids.keys())
+    _write_data_yaml(output_dir, class_map, all_split_names)
+
+    total = 0
+    per_split = {}
+    for split_name, ids in split_ids.items():
+        if not ids:
+            per_split[split_name] = 0
+            continue
+        img_dir = _ensure_dir(output_dir / split_name / "images")
+        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
+        sub_view = view.select(ids)
+
+        count = 0
+        for sample in sub_view.iter_samples(progress=True):
+            label_data = sample[label_field]
+            if label_data is None or not label_data.detections:
+                continue
+
+            fname = _copy_image(sample.filepath, img_dir)
+            stem = Path(fname).stem
+            lines = []
+
+            for det in label_data.detections:
+                if classes and det.label not in classes:
+                    continue
+                if det.label not in class_map:
+                    continue
+
+                cls_id = class_map[det.label]
+                x, y, w, h = det.bounding_box
+                rotation = getattr(det, "rotation", None) or det.get_attribute_value("rotation", 0)
+                if rotation is None:
+                    rotation = 0
+
+                cx = x + w / 2
+                cy = y + h / 2
+                angle = float(rotation) * np.pi / 180
+
+                cos_a = np.cos(angle)
+                sin_a = np.sin(angle)
+                hw, hh = w / 2, h / 2
+
+                corners = [
+                    (-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)
+                ]
+                rotated = []
+                for dx, dy in corners:
+                    rx = cx + dx * cos_a - dy * sin_a
+                    ry = cy + dx * sin_a + dy * cos_a
+                    rotated.extend([f"{rx:.6f}", f"{ry:.6f}"])
+
+                lines.append(f"{cls_id} " + " ".join(rotated))
+
+            if lines:
+                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                count += 1
+
+        per_split[split_name] = count
+        total += count
+
+    return {"exported": total, "per_split": per_split, "classes": list(class_map.keys())}

@@ -2,7 +2,7 @@ import albumentations as A
 
 from ultralytics import YOLO
 
-model = YOLO("yolo26m-pose.pt")
+model = YOLO("yolo11m-pose.pt")
 
 # AGV 托盘识别场景的 Albumentations 自定义增强
 # 模拟仓库中常见的图像质量问题：运动模糊、传感器噪声、低光照对比度差
@@ -21,7 +21,7 @@ custom_transforms = [
 ]
 
 results = model.train(
-    data="/home/cotek/datasets/Thoro_pallet_dataset_v0.3_cvat_yolo_pose/data.yaml",
+    data="/home/cotek/datasets/temp/pose/data.yaml",
     epochs=150,
     imgsz=640,
     # --- 色彩空间增强 ---

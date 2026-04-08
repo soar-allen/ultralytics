@@ -160,7 +160,13 @@ def infer_flip_idx(keypoint_names: list[str]):
 
 def parse_cvat_meta(root: ET.Element):
     label_meta = OrderedDict()
-    for label_el in root.findall("./meta/task/labels/label"):
+
+    # CVAT exports use meta/task (task-level export) or meta/job (job-level export)
+    label_els = root.findall("./meta/task/labels/label")
+    if not label_els:
+        label_els = root.findall("./meta/job/labels/label")
+
+    for label_el in label_els:
         label_name_el = label_el.find("name")
         label_type_el = label_el.find("type")
         if label_name_el is None or label_type_el is None:
@@ -200,12 +206,19 @@ def parse_skeleton_instance(skeleton_el: ET.Element, keypoint_names: list[str], 
 
         x, y = parse_point_xy(point_el.get("points", "0,0"))
         visibility = cvat_point_visibility(point_el)
-        x_norm, y_norm = normalize_xy(x, y, width, height)
-        keypoints.extend([x_norm, y_norm, visibility])
-        all_bbox_points.append((x, y))
 
+        # bbox uses real coordinates for all non-missing points
+        all_bbox_points.append((x, y))
         if visibility > 0:
             visible_bbox_points.append((x, y))
+
+        # YOLO output: only visible (v=2) keypoints keep coordinates;
+        # occluded/outside → (0, 0, 0) to avoid data-augmentation artifacts.
+        if visibility == 2:
+            x_norm, y_norm = normalize_xy(x, y, width, height)
+            keypoints.extend([x_norm, y_norm, 2])
+        else:
+            keypoints.extend([0.0, 0.0, 0])
 
     bbox_points = visible_bbox_points or all_bbox_points
     if not bbox_points:
