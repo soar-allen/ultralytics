@@ -145,6 +145,133 @@ def find_corrupt_or_abnormal(
 
 
 # ===================================================================
+# 2b. 多边形处理（转四角 / 边界检测）
+# ===================================================================
+
+def _extract_quad(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """从任意多边形顶点中提取 tl/tr/br/bl 四个极角点。"""
+    arr = np.array(pts, dtype=np.float64)
+    s = arr.sum(axis=1)
+    d = arr[:, 0] - arr[:, 1]
+    tl = arr[int(np.argmin(s))]
+    br = arr[int(np.argmax(s))]
+    tr = arr[int(np.argmax(d))]
+    bl = arr[int(np.argmin(d))]
+    return [
+        (float(tl[0]), float(tl[1])),
+        (float(tr[0]), float(tr[1])),
+        (float(br[0]), float(br[1])),
+        (float(bl[0]), float(bl[1])),
+    ]
+
+
+def convert_polylines_to_quads(
+    ds: fo.Dataset | fo.DatasetView,
+    label_field: str,
+) -> dict:
+    """
+    将多边形标注转换为四角多边形（取 tl/tr/br/bl 四个极角点）。
+
+    对点数 < 4 的多边形跳过，点数 == 4 的保持不变（仅重新排序），
+    点数 > 4 的提取四个极角点。
+
+    Returns:
+        {"converted": int, "skipped_few_pts": int, "already_quad": int, "total_polys": int}
+    """
+    stats = defaultdict(int)
+
+    for sample in ds.iter_samples(progress=True, autosave=True):
+        container = sample[label_field]
+        if container is None:
+            continue
+        polylines = getattr(container, "polylines", None)
+        if not polylines:
+            continue
+
+        for poly in polylines:
+            new_rings = []
+            for ring in poly.points:
+                stats["total_polys"] += 1
+                if len(ring) < 4:
+                    stats["skipped_few_pts"] += 1
+                    new_rings.append(ring)
+                elif len(ring) == 4:
+                    stats["already_quad"] += 1
+                    new_rings.append(_extract_quad(ring))
+                else:
+                    stats["converted"] += 1
+                    new_rings.append(_extract_quad(ring))
+            poly.points = new_rings
+
+    logger.info("多边形转四角: %s (field=%s)", dict(stats), label_field)
+    return dict(stats)
+
+
+def find_boundary_polylines(
+    ds: fo.Dataset | fo.DatasetView,
+    label_field: str,
+    edge_threshold: float = 0.005,
+    tag: str = "bad_polygon",
+) -> list[str]:
+    """
+    标记「单多边形 + 角点贴近图像边界」的样本。
+
+    判定条件（同时满足）：
+      1. 样本在 label_field 中只有 1 个多边形
+      2. 该多边形的 4 个顶点中有 ≥1 个顶点的归一化坐标
+         贴近边界（x < threshold 或 x > 1-threshold 或 y 同理）
+
+    Args:
+        edge_threshold: 归一化阈值，默认 0.005（约为 1000px 图像的 5px）
+
+    Returns:
+        被标记的 sample ID 列表
+    """
+    bad_ids = []
+
+    for sample in ds.iter_samples(progress=True):
+        container = sample[label_field]
+        if container is None:
+            continue
+        polylines = getattr(container, "polylines", None)
+        if not polylines or len(polylines) != 1:
+            continue
+
+        ring = polylines[0].points[0] if polylines[0].points else []
+        if len(ring) != 4:
+            continue
+
+        on_boundary = False
+        for x, y in ring:
+            if (x < edge_threshold or x > 1.0 - edge_threshold
+                    or y < edge_threshold or y > 1.0 - edge_threshold):
+                on_boundary = True
+                break
+
+        if on_boundary:
+            if tag not in sample.tags:
+                sample.tags.append(tag)
+                sample.save()
+            bad_ids.append(sample.id)
+
+    logger.info(
+        "边界多边形检测: %d 个样本 (threshold=%.4f, field=%s)",
+        len(bad_ids), edge_threshold, label_field,
+    )
+    return bad_ids
+
+
+def clear_tag(ds: fo.Dataset, tag: str) -> int:
+    """移除数据集中所有样本的指定标签，返回受影响的样本数。"""
+    count = 0
+    for sample in ds.match_tags([tag]).iter_samples(autosave=True):
+        if tag in sample.tags:
+            sample.tags.remove(tag)
+            count += 1
+    return count
+
+
+# ===================================================================
 # 3. 重复图像检测与清理
 # ===================================================================
 

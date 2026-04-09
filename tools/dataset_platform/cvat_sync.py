@@ -27,15 +27,21 @@ logger = logging.getLogger(__name__)
 # 连接配置
 # ===================================================================
 
-def _get_cvat_kwargs() -> dict:
-    """构建 CVAT 连接参数。包含 organization 时推送/拉取都会指向该组织空间。"""
-    kwargs = {
+def _get_cvat_cred_kwargs() -> dict:
+    """仅含认证信息的 CVAT 连接参数（不含 organization），用于 load_annotations 等接口。"""
+    return {
         "url": CONFIG.cvat.url,
         "username": CONFIG.cvat.username,
         "password": CONFIG.cvat.password,
     }
-    if CONFIG.cvat.organization:
-        kwargs["organization"] = CONFIG.cvat.organization
+
+
+def _get_cvat_kwargs() -> dict:
+    """构建 CVAT 连接参数。包含 organization 时推送/拉取都会指向该组织空间。"""
+    kwargs = _get_cvat_cred_kwargs()
+    org = (CONFIG.cvat.organization or "").strip()
+    if org:
+        kwargs["organization"] = org
     return kwargs
 
 
@@ -118,6 +124,17 @@ def test_connection() -> dict:
         )
         if task_resp.ok:
             result["tasks_count"] = task_resp.json().get("count", 0)
+
+        org_resp = requests.get(
+            f"{url}/api/organizations",
+            auth=(CONFIG.cvat.username, CONFIG.cvat.password),
+            timeout=10,
+        )
+        if org_resp.ok:
+            orgs = org_resp.json().get("results", org_resp.json() if isinstance(org_resp.json(), list) else [])
+            result["organizations"] = [
+                {"slug": o.get("slug", ""), "name": o.get("name", "")} for o in orgs
+            ]
 
         result["connected"] = True
 
@@ -221,6 +238,11 @@ def push_to_cvat(
             kwargs["label_type"] = label_type
         if classes:
             kwargs["classes"] = classes
+        elif field_exists:
+            from .data_manager import get_label_classes
+            detected_cls = get_label_classes(ds, label_field)
+            if detected_cls:
+                kwargs["classes"] = detected_cls
         if occluded_attr:
             kwargs["occluded_attr"] = occluded_attr
         if attributes:
@@ -235,6 +257,15 @@ def push_to_cvat(
     try:
         samples.annotate(anno_key, **kwargs)
     except Exception as e:
+        # annotate() 在调用 CVAT API 前就会注册 anno_key，
+        # 失败后需要清理，否则用户无法用同一 key 重试
+        try:
+            if anno_key in ds.list_annotation_runs():
+                ds.delete_annotation_run(anno_key)
+                logger.info("推送失败，已自动清理残留 anno_key: %s", anno_key)
+        except Exception:
+            pass
+
         err_msg = str(e).lower()
         if "connection" in err_msg or "connect" in err_msg:
             raise ConnectionError(
@@ -249,6 +280,22 @@ def push_to_cvat(
                 "CVAT 认证失败。\n"
                 "解决办法：检查侧边栏中的用户名和密码"
             ) from e
+        if "same organization" in err_msg:
+            org = (CONFIG.cvat.organization or "").strip()
+            if org:
+                raise ValueError(
+                    f"CVAT 组织不匹配：当前设置的组织为 '{org}'，但任务与项目不在同一组织下。\n"
+                    "解决办法：在侧边栏「CVAT 配置 → Organization」中检查组织 slug 是否正确，"
+                    "或留空以推送到个人空间。可通过「测试 CVAT 连接」查看你的账号所属组织。"
+                ) from e
+            else:
+                raise ValueError(
+                    "CVAT 组织不匹配：当前未设置组织，但 CVAT 端存在同名项目属于某个组织。\n"
+                    "解决办法：\n"
+                    "1. 在侧边栏「CVAT 配置 → Organization」中填写正确的组织 slug\n"
+                    "2. 或使用不同的项目名称推送到个人空间\n"
+                    "可通过「测试 CVAT 连接」查看你的账号所属组织。"
+                ) from e
         if "already exists" in err_msg or "anno_key" in err_msg:
             raise ValueError(
                 f"标注键 '{anno_key}' 已存在。\n"
@@ -338,7 +385,7 @@ def pull_from_cvat(
         )
 
     try:
-        ds.load_annotations(anno_key, cleanup=cleanup, **_get_cvat_kwargs())
+        ds.load_annotations(anno_key, cleanup=cleanup, **_get_cvat_cred_kwargs())
     except Exception as e:
         err_msg = str(e).lower()
         if "connection" in err_msg or "connect" in err_msg:
@@ -392,7 +439,7 @@ def delete_annotation_run(ds: fo.Dataset, anno_key: str, cleanup: bool = False) 
     """删除标注运行记录。cleanup=True 时同时删除 CVAT 端的任务。"""
     if cleanup:
         try:
-            results = ds.load_annotation_results(anno_key, **_get_cvat_kwargs())
+            results = ds.load_annotation_results(anno_key, **_get_cvat_cred_kwargs())
             results.cleanup()
         except Exception as e:
             logger.warning("CVAT 清理失败 (anno_key=%s): %s", anno_key, e)
@@ -404,7 +451,7 @@ def delete_annotation_run(ds: fo.Dataset, anno_key: str, cleanup: bool = False) 
 def get_annotation_status(ds: fo.Dataset, anno_key: str) -> dict:
     """查询 CVAT 标注任务状态。"""
     try:
-        results = ds.load_annotation_results(anno_key, **_get_cvat_kwargs())
+        results = ds.load_annotation_results(anno_key, **_get_cvat_cred_kwargs())
         api = results.connect_to_api()
 
         status_info = {"anno_key": anno_key, "tasks": []}

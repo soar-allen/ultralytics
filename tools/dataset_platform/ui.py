@@ -301,6 +301,15 @@ def _render_sidebar():
                     info_lines.append(f"- 项目数: {result['projects_count']}")
                 if result["tasks_count"] is not None:
                     info_lines.append(f"- 任务数: {result['tasks_count']}")
+                orgs = result.get("organizations", [])
+                if orgs:
+                    org_names = [f"`{o['slug']}`" + (f" ({o['name']})" if o['name'] else "") for o in orgs]
+                    info_lines.append(f"- 组织: {', '.join(org_names)}")
+                    if not CONFIG.cvat.organization:
+                        st.sidebar.warning(
+                            f"检测到你的账号属于组织 {', '.join(org_names)}，"
+                            "但「Organization」字段为空。如果推送失败，请填入对应的组织 slug。"
+                        )
                 st.sidebar.markdown("\n".join(info_lines))
             else:
                 status.update(label="连接失败", state="error")
@@ -578,6 +587,92 @@ def _render_processing():
         _render_auto_predict(ds)
 
 
+def _render_bad_polylines(ds):
+    st.subheader("多边形处理")
+
+    info = dm.get_dataset_info(ds)
+    poly_fields = [f for f in info.get("label_fields", []) if dm.get_field_label_type(ds, f) == "polylines"]
+
+    if not poly_fields:
+        st.info("当前数据集没有多边形 (Polylines) 类型的标签字段")
+        return
+
+    bp_field = st.selectbox("多边形字段", poly_fields, key="bp_field")
+
+    bp_scope = st.radio("操作范围", ["整个数据集", "按标签筛选"], key="bp_scope", horizontal=True)
+    bp_view = ds
+    if bp_scope == "按标签筛选":
+        avail = ds.distinct("tags")
+        if avail:
+            bp_tags = st.multiselect("选择标签", avail, key="bp_scope_tags")
+            if bp_tags:
+                bp_view = ds.match_tags(bp_tags)
+        else:
+            st.info("当前数据集没有任何标签")
+    st.caption(f"操作范围: **{len(bp_view)}** 个样本")
+
+    tab_convert, tab_boundary = st.tabs(["🔄 多边形转四角", "⚠️ 边界多边形检测"])
+
+    # ---- Tab 1: 多边形转四角 ----
+    with tab_convert:
+        st.caption(
+            "将 N 点多边形转换为 4 点四边形：从所有顶点中提取左上 (tl)、右上 (tr)、"
+            "右下 (br)、左下 (bl) 四个极角点。已经是 4 点的多边形仅重新排序为 tl→tr→br→bl。"
+        )
+        if st.button("🔄 执行转换", key="btn_convert_quads"):
+            with st.spinner(f"转换 {len(bp_view)} 个样本中..."):
+                stats = processor.convert_polylines_to_quads(bp_view, label_field=bp_field)
+            st.success("转换完成")
+            st.json(stats)
+
+    # ---- Tab 2: 边界多边形检测 ----
+    with tab_boundary:
+        st.caption(
+            "检测「单多边形 + 角点贴近图像边界」的样本：如果一张图片仅有 1 个四角多边形，"
+            "且任一顶点的归一化坐标贴近图像边缘（≈ 被截断），则标记为 `bad_polygon`。"
+        )
+        edge_th = st.slider(
+            "边界阈值（归一化）", min_value=0.001, max_value=0.05, value=0.005, step=0.001,
+            key="bp_edge_threshold",
+            help="顶点坐标距边界小于此值即判定为贴近边界。0.005 ≈ 1000px 图像的 5px",
+        )
+
+        bad_tag = "bad_polygon"
+        bad_count = len(ds.match_tags([bad_tag]))
+        if bad_count > 0:
+            st.warning(f"当前有 **{bad_count}** 个样本标记为 `{bad_tag}`")
+            bp_act1, bp_act2 = st.columns(2)
+            with bp_act1:
+                bp_del_physical = st.checkbox("同时删除磁盘文件", key="bp_del_physical")
+                if st.button("🗑️ 删除已标记的异常样本", key="btn_del_bad_poly", type="primary"):
+                    with st.spinner("删除中..."):
+                        bad_view = ds.match_tags([bad_tag])
+                        ids = bad_view.values("id")
+                        if bp_del_physical:
+                            dm.delete_samples_physically(ds, ids)
+                        else:
+                            ds.delete_samples(ids)
+                    st.session_state["_toast_msg"] = f"已删除 {len(ids)} 个边界多边形样本"
+                    st.rerun()
+            with bp_act2:
+                if st.button("🧹 清除 bad_polygon 标记", key="btn_clear_bad_poly",
+                             help="仅移除标签，不删除样本"):
+                    with st.spinner("清除中..."):
+                        cleared = processor.clear_tag(ds, bad_tag)
+                    st.session_state["_toast_msg"] = f"已清除 {cleared} 个样本的 {bad_tag} 标记"
+                    st.rerun()
+
+        if st.button("🔍 扫描边界多边形", key="btn_scan_bad_poly"):
+            with st.spinner(f"扫描 {len(bp_view)} 个样本中..."):
+                bad_ids = processor.find_boundary_polylines(
+                    bp_view, label_field=bp_field, edge_threshold=edge_th, tag=bad_tag,
+                )
+            if bad_ids:
+                st.error(f"发现 **{len(bad_ids)}** 个样本的多边形角点贴近图像边界")
+            else:
+                st.success("未发现边界多边形")
+
+
 def _render_cleaning(ds):
     col1, col2 = st.columns(2)
 
@@ -612,6 +707,9 @@ def _render_cleaning(ds):
                 st.success(f"✅ 物理删除 {count} 个样本")
                 del st.session_state["corrupt_ids"]
                 st.rerun()
+
+    st.markdown("---")
+    _render_bad_polylines(ds)
 
     st.markdown("---")
     col3, col4 = st.columns(2)
@@ -703,18 +801,34 @@ def _render_cleaning(ds):
         dup_count = len(ds.match_tags(["duplicate"]))
         if dup_count > 0:
             st.warning(f"当前有 **{dup_count}** 个样本标记为 `duplicate`")
-            if st.button("🧹 清除所有 duplicate 标记", key="btn_clear_dup_tag",
-                         help="移除所有样本的 duplicate 标签，以便用新参数重新扫描去重"):
-                with st.spinner("清除中..."):
-                    cleared = 0
-                    for sample in ds.match_tags(["duplicate"]).iter_samples(autosave=True):
-                        if "duplicate" in sample.tags:
-                            sample.tags.remove("duplicate")
-                            cleared += 1
-                st.session_state["_toast_msg"] = f"已清除 {cleared} 个样本的 duplicate 标记"
-                if "dup_groups" in st.session_state:
-                    del st.session_state["dup_groups"]
-                st.rerun()
+            dup_col1, dup_col2 = st.columns(2)
+            with dup_col1:
+                dup_del_physical = st.checkbox("同时删除磁盘文件", key="dup_del_existing_physical")
+                if st.button("🗑️ 删除已标记的重复样本", key="btn_del_dup_tagged", type="primary"):
+                    with st.spinner("删除中..."):
+                        dup_view = ds.match_tags(["duplicate"])
+                        ids = dup_view.values("id")
+                        if dup_del_physical:
+                            dm.delete_samples_physically(ds, ids)
+                        else:
+                            ds.delete_samples(ids)
+                    st.session_state["_toast_msg"] = f"已删除 {len(ids)} 个重复样本"
+                    if "dup_groups" in st.session_state:
+                        del st.session_state["dup_groups"]
+                    st.rerun()
+            with dup_col2:
+                if st.button("🧹 清除 duplicate 标记", key="btn_clear_dup_tag",
+                             help="仅移除标签，不删除样本。用于调整参数重新扫描"):
+                    with st.spinner("清除中..."):
+                        cleared = 0
+                        for sample in ds.match_tags(["duplicate"]).iter_samples(autosave=True):
+                            if "duplicate" in sample.tags:
+                                sample.tags.remove("duplicate")
+                                cleared += 1
+                    st.session_state["_toast_msg"] = f"已清除 {cleared} 个样本的 duplicate 标记"
+                    if "dup_groups" in st.session_state:
+                        del st.session_state["dup_groups"]
+                    st.rerun()
 
         if st.button("🔍 扫描重复图像", key="btn_scan_dup"):
             all_groups = []
@@ -1117,9 +1231,12 @@ def _render_cvat_push(ds):
 
                 label_schema = {}
                 for f in selected_fields:
+                    all_cls = field_type_map[f]["classes"]
                     entry = {}
                     if f in field_classes_filter:
                         entry["classes"] = field_classes_filter[f]
+                    elif all_cls:
+                        entry["classes"] = all_cls
                     if f in polyline_fields and include_occu_attrs:
                         entry["attributes"] = cvat_sync.OCCLUSION_ATTRS
                     label_schema[f] = entry
@@ -1187,6 +1304,14 @@ def _render_cvat_push(ds):
             help="上传到 CVAT 的图像压缩质量 (1~100)，100 为无损。FiftyOne 默认 75，此处默认 100",
         )
 
+    # -- 多字段提示 --
+    is_multi_field = label_schema is not None and len(label_schema) > 1
+    if is_multi_field:
+        st.info(
+            f"已选 **{len(label_schema)}** 个字段，将逐字段推送到独立 CVAT 任务。"
+            f"每个字段的标注键格式为 `{{anno_key}}_{{字段名}}`，拉取时分别操作。"
+        )
+
     # -- 推送按钮 --
     can_push = label_schema is not None or single_label_field
     if st.button("📤 推送到 CVAT", key="btn_push", disabled=not can_push):
@@ -1196,9 +1321,21 @@ def _render_cvat_push(ds):
         if not anno_key.replace("_", "").replace("-", "").isalnum():
             st.error("标注键只能包含字母、数字、下划线和短横线")
             return
-        if anno_key in existing_runs:
-            st.error(f"标注键 `{anno_key}` 已存在！请使用不同的 key，或先在「管理标注运行」中删除旧记录。")
-            return
+
+        # anno_key 冲突检测：多字段模式检查每个派生 key，单字段模式检查原始 key
+        if is_multi_field:
+            derived_keys = {f: f"{anno_key}_{f}" for f in label_schema}
+            conflicts = [k for k in derived_keys.values() if k in existing_runs]
+            if conflicts:
+                st.error(
+                    f"以下标注键已存在: **{', '.join(conflicts)}**\n\n"
+                    "请使用不同的 anno_key，或先在「管理标注运行」中删除旧记录。"
+                )
+                return
+        else:
+            if anno_key in existing_runs:
+                st.error(f"标注键 `{anno_key}` 已存在！请使用不同的 key，或先在「管理标注运行」中删除旧记录。")
+                return
 
         ref_field = list(label_schema.keys())[0] if label_schema else single_label_field
         samples = ds
@@ -1214,30 +1351,52 @@ def _render_cvat_push(ds):
             st.error("所选范围内没有样本可推送")
             return
 
-        with st.spinner(f"正在推送 {len(samples)} 个样本到 CVAT..."):
-            try:
-                if label_schema:
-                    result = cvat_sync.push_to_cvat(
-                        samples, anno_key,
-                        label_schema=label_schema,
-                        segment_size=segment_size,
-                        image_quality=image_quality,
-                    )
-                else:
-                    result = cvat_sync.push_to_cvat(
-                        samples, anno_key,
-                        label_field=single_label_field,
-                        label_type=single_label_type,
-                        segment_size=segment_size,
-                        image_quality=image_quality,
-                        classes=selected_classes or None,
-                        attributes=single_push_attrs,
-                    )
-                st.success("✅ 推送成功")
-                st.json(result)
-                st.info("💡 现在可以在 CVAT 中进行标注，完成后回到「从 CVAT 拉取」页面同步结果。")
-            except Exception as e:
-                st.error(f"推送失败: {e}")
+        if is_multi_field:
+            # 多字段模式：逐字段推送，每个字段独立 anno_key 和 CVAT 任务
+            all_results = []
+            for field_name, field_config in label_schema.items():
+                field_key = f"{anno_key}_{field_name}"
+                with st.spinner(f"正在推送字段 `{field_name}` ({len(samples)} 样本)..."):
+                    try:
+                        r = cvat_sync.push_to_cvat(
+                            samples, field_key,
+                            label_schema={field_name: field_config},
+                            segment_size=segment_size,
+                            image_quality=image_quality,
+                        )
+                        all_results.append(r)
+                        st.success(f"✅ 字段 `{field_name}` 推送成功 (anno_key: `{field_key}`)")
+                    except Exception as field_e:
+                        st.error(f"❌ 字段 `{field_name}` 推送失败: {field_e}")
+            if all_results:
+                st.json(all_results)
+                st.info("💡 多字段推送完成。拉取标注时请在「从 CVAT 拉取」中分别选择每个字段的 anno_key。")
+        else:
+            # 单字段模式（含 label_schema 仅 1 个字段 和纯单字段模式）
+            with st.spinner(f"正在推送 {len(samples)} 个样本到 CVAT..."):
+                try:
+                    if label_schema:
+                        result = cvat_sync.push_to_cvat(
+                            samples, anno_key,
+                            label_schema=label_schema,
+                            segment_size=segment_size,
+                            image_quality=image_quality,
+                        )
+                    else:
+                        result = cvat_sync.push_to_cvat(
+                            samples, anno_key,
+                            label_field=single_label_field,
+                            label_type=single_label_type,
+                            segment_size=segment_size,
+                            image_quality=image_quality,
+                            classes=selected_classes or None,
+                            attributes=single_push_attrs,
+                        )
+                    st.success("✅ 推送成功")
+                    st.json(result)
+                    st.info("💡 现在可以在 CVAT 中进行标注，完成后回到「从 CVAT 拉取」页面同步结果。")
+                except Exception as e:
+                    st.error(f"推送失败: {e}")
 
 
 def _render_cvat_pull(ds):
@@ -1296,12 +1455,19 @@ def _render_cvat_manage(ds):
         st.dataframe(df, use_container_width=True)
 
         del_key = st.selectbox("选择要删除的运行", [r["anno_key"] for r in runs], key="del_run_key")
-        col1, col2 = st.columns(2)
-        with col1:
-            cleanup_cvat = st.checkbox("同时清理 CVAT 端", key="del_cleanup_cvat",
-                                       help="勾选后，删除运行记录的同时会删除 CVAT 服务器上的任务")
-        with col2:
-            if st.button("🗑️ 删除标注运行", key="btn_del_run"):
+        cleanup_cvat = st.checkbox("同时清理 CVAT 端", key="del_cleanup_cvat",
+                                   help="勾选后，删除运行记录的同时会删除 CVAT 服务器上的任务")
+
+        st.warning(f"⚠️ 即将删除标注运行: **{del_key}**"
+                   + ("（同时删除 CVAT 端任务）" if cleanup_cvat else "（仅删除本地记录）"))
+        confirm_del = st.text_input(
+            f"请输入标注键 `{del_key}` 确认删除", key="del_run_confirm",
+            placeholder=f"输入 {del_key} 确认",
+        )
+        if st.button("🗑️ 确认删除标注运行", key="btn_del_run", type="primary"):
+            if confirm_del != del_key:
+                st.error(f"输入不匹配，请输入 `{del_key}` 以确认删除")
+            else:
                 try:
                     cvat_sync.delete_annotation_run(ds, del_key, cleanup=cleanup_cvat)
                     st.session_state["_toast_msg"] = f"已删除标注运行: {del_key}"
