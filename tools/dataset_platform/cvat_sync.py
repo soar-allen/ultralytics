@@ -471,3 +471,200 @@ def get_annotation_status(ds: fo.Dataset, anno_key: str) -> dict:
         return status_info
     except Exception as e:
         return {"anno_key": anno_key, "error": str(e)}
+
+
+# ===================================================================
+# Job 级别状态查询
+# ===================================================================
+
+REVIEW_FIELD = "_review"
+REVIEW_CLASSES = ["discard"]
+
+
+def _cvat_get_paginated(endpoint: str, params: Optional[dict] = None) -> list:
+    """从 CVAT REST API 分页获取所有结果。"""
+    import requests
+
+    base = CONFIG.cvat.url.rstrip("/")
+    auth = (CONFIG.cvat.username, CONFIG.cvat.password)
+    results: list = []
+    page_url = f"{base}{endpoint}"
+
+    while page_url:
+        resp = requests.get(page_url, auth=auth, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            results.extend(data)
+            break
+        results.extend(data.get("results", []))
+        page_url = data.get("next")
+        params = None
+    return results
+
+
+def get_job_details(ds: fo.Dataset, anno_key: str) -> list[dict]:
+    """查询某个标注运行下所有 CVAT Job 的详细状态。
+
+    CVAT Job 生命周期::
+
+        stage (工作阶段): annotation → validation → acceptance
+        state (完成状态): new → in progress → completed / rejected
+
+    Returns:
+        每个 Job 的信息列表，包含 job_id / task_id / state / stage /
+        assignee / frame 范围 / 关联的 FiftyOne sample_ids 等。
+    """
+    results = ds.load_annotation_results(anno_key, **_get_cvat_cred_kwargs())
+    task_ids = getattr(results, "task_ids", [])
+    frame_id_map = getattr(results, "frame_id_map", {})
+
+    all_jobs: list[dict] = []
+    for tid in task_ids:
+        try:
+            jobs = _cvat_get_paginated("/api/jobs", params={"task_id": tid, "page_size": 100})
+        except Exception as e:
+            logger.warning("获取 task %s 的 jobs 失败: %s", tid, e)
+            continue
+
+        task_frames: dict = frame_id_map.get(tid, frame_id_map.get(str(tid), {}))
+
+        for job in jobs:
+            start = job.get("start_frame", 0)
+            stop = job.get("stop_frame", 0)
+
+            sample_ids: list[str] = []
+            for fid, sid in task_frames.items():
+                fid_int = int(fid) if isinstance(fid, str) else fid
+                if start <= fid_int <= stop:
+                    sample_ids.append(sid)
+
+            all_jobs.append({
+                "job_id": job["id"],
+                "task_id": tid,
+                "state": job.get("state", "unknown"),
+                "stage": job.get("stage", "unknown"),
+                "assignee": (job.get("assignee") or {}).get("username", ""),
+                "start_frame": start,
+                "stop_frame": stop,
+                "frame_count": stop - start + 1,
+                "num_samples": len(sample_ids) if sample_ids else (stop - start + 1),
+                "sample_ids": sample_ids,
+            })
+    return all_jobs
+
+
+def tag_samples_by_job_status(
+    ds: fo.Dataset,
+    anno_key: str,
+    tag_prefix: str = "job",
+) -> dict[str, int]:
+    """根据 CVAT Job 状态为 FiftyOne 样本打标签。
+
+    为每个样本添加 ``{prefix}_{state}`` 和 ``{prefix}_{stage}`` 标签，
+    例如 ``job_completed``、``job_acceptance``。
+    """
+    jobs = get_job_details(ds, anno_key)
+    tagged: dict[str, int] = {}
+
+    for job in jobs:
+        sids = job["sample_ids"]
+        if not sids:
+            continue
+        state_tag = f"{tag_prefix}_{job['state'].replace(' ', '_')}"
+        stage_tag = f"{tag_prefix}_{job['stage'].replace(' ', '_')}"
+        view = ds.select(sids)
+        for tag in (state_tag, stage_tag):
+            view.tag_samples(tag)
+            tagged[tag] = tagged.get(tag, 0) + len(sids)
+    return tagged
+
+
+def get_samples_by_job_status(
+    ds: fo.Dataset,
+    anno_key: str,
+    states: Optional[list[str]] = None,
+    stages: Optional[list[str]] = None,
+) -> fo.DatasetView:
+    """获取特定 Job 状态/阶段下的样本视图。
+
+    *states* 与 *stages* 为 AND 关系，``None`` 表示不过滤该维度。
+    """
+    jobs = get_job_details(ds, anno_key)
+    matching_ids: list[str] = []
+    for job in jobs:
+        state_ok = states is None or job["state"] in states
+        stage_ok = stages is None or job["stage"] in stages
+        if state_ok and stage_ok:
+            matching_ids.extend(job["sample_ids"])
+    if not matching_ids:
+        return ds.limit(0)
+    return ds.select(matching_ids)
+
+
+# ===================================================================
+# 废弃图片管理
+# ===================================================================
+
+def find_discarded_samples(
+    ds: fo.Dataset,
+    review_field: str = REVIEW_FIELD,
+) -> fo.DatasetView:
+    """查找在 CVAT 中被标记为「废弃」的样本。
+
+    推送时需启用废弃标记字段，标注员在 CVAT 的 tag 面板选择 ``discard``，
+    拉取后调用本函数即可获取对应样本视图。
+    """
+    from fiftyone import ViewField as F
+
+    schema = ds.get_field_schema()
+    if review_field not in schema:
+        return ds.limit(0)
+    return ds.filter_labels(review_field, F("label") == "discard", only_matches=True)
+
+
+def handle_discarded_samples(
+    ds: fo.Dataset,
+    review_field: str = REVIEW_FIELD,
+    action: str = "tag",
+    tag_name: str = "discarded",
+) -> dict:
+    """处理废弃样本。
+
+    Args:
+        action:
+            - ``"tag"``: 为废弃样本打上 *tag_name* 标签
+            - ``"remove"``: 从数据集中移除（保留物理文件）
+            - ``"remove_and_delete"``: 移除并删除物理文件
+    """
+    discarded = find_discarded_samples(ds, review_field)
+    count = len(discarded)
+    if count == 0:
+        return {"action": action, "count": 0, "message": "未发现废弃样本"}
+
+    if action == "tag":
+        discarded.tag_samples(tag_name)
+        return {"action": action, "count": count, "tag": tag_name}
+
+    if action in ("remove", "remove_and_delete"):
+        sample_ids = discarded.values("id")
+        filepaths = discarded.values("filepath") if action == "remove_and_delete" else []
+        ds.delete_samples(sample_ids)
+
+        deleted_files = 0
+        if filepaths:
+            import os
+            for p in filepaths:
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                        deleted_files += 1
+                except OSError as e:
+                    logger.warning("删除文件失败 %s: %s", p, e)
+
+        result: dict = {"action": action, "count": count}
+        if deleted_files:
+            result["deleted_files"] = deleted_files
+        return result
+
+    raise ValueError(f"未知操作: {action}")

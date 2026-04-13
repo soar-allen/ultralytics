@@ -1130,7 +1130,9 @@ def _render_cvat_sync():
         """)
 
 
-    tab_push, tab_pull, tab_manage = st.tabs(["📤 推送到 CVAT", "📥 从 CVAT 拉取", "📋 管理标注运行"])
+    tab_push, tab_pull, tab_manage, tab_review = st.tabs([
+        "📤 推送到 CVAT", "📥 从 CVAT 拉取", "📋 管理标注运行", "🔍 任务状态与审核",
+    ])
 
     with tab_push:
         _render_cvat_push(ds)
@@ -1138,6 +1140,8 @@ def _render_cvat_sync():
         _render_cvat_pull(ds)
     with tab_manage:
         _render_cvat_manage(ds)
+    with tab_review:
+        _render_cvat_review(ds)
 
 
 def _render_cvat_push(ds):
@@ -1304,6 +1308,18 @@ def _render_cvat_push(ds):
             help="上传到 CVAT 的图像压缩质量 (1~100)，100 为无损。FiftyOne 默认 75，此处默认 100",
         )
 
+    # -- 废弃标记 --
+    include_review = st.checkbox(
+        "启用废弃标记（允许标注员在 CVAT 中标记需废弃的图片）",
+        value=False,
+        key="push_include_review",
+        help=(
+            "勾选后在 CVAT 任务中添加 'discard' 标签选项。"
+            "标注员可在 CVAT 的 Tag 面板中选择 discard 来标记质量差的图片。"
+            "拉取后可在「任务状态与审核」中统一处理废弃图片。"
+        ),
+    )
+
     # -- 多字段提示 --
     is_multi_field = label_schema is not None and len(label_schema) > 1
     if is_multi_field:
@@ -1351,16 +1367,26 @@ def _render_cvat_push(ds):
             st.error("所选范围内没有样本可推送")
             return
 
+        review_schema = (
+            {cvat_sync.REVIEW_FIELD: {"type": "classifications", "classes": cvat_sync.REVIEW_CLASSES}}
+            if include_review else {}
+        )
+
         if is_multi_field:
             # 多字段模式：逐字段推送，每个字段独立 anno_key 和 CVAT 任务
             all_results = []
-            for field_name, field_config in label_schema.items():
+            review_key = None
+            for idx, (field_name, field_config) in enumerate(label_schema.items()):
                 field_key = f"{anno_key}_{field_name}"
+                push_schema = {field_name: field_config}
+                if idx == 0 and review_schema:
+                    push_schema.update(review_schema)
+                    review_key = field_key
                 with st.spinner(f"正在推送字段 `{field_name}` ({len(samples)} 样本)..."):
                     try:
                         r = cvat_sync.push_to_cvat(
                             samples, field_key,
-                            label_schema={field_name: field_config},
+                            label_schema=push_schema,
                             segment_size=segment_size,
                             image_quality=image_quality,
                         )
@@ -1371,14 +1397,30 @@ def _render_cvat_push(ds):
             if all_results:
                 st.json(all_results)
                 st.info("💡 多字段推送完成。拉取标注时请在「从 CVAT 拉取」中分别选择每个字段的 anno_key。")
+            if review_key:
+                st.info(f"🗑️ 废弃标记功能已包含在标注键 `{review_key}` 的 CVAT 任务中。"
+                        f"标注员可在该任务的 Tag 面板选择 **discard** 标记废弃图片。"
+                        f"拉取该标注键后可在「任务状态与审核」中管理废弃图片。")
         else:
             # 单字段模式（含 label_schema 仅 1 个字段 和纯单字段模式）
             with st.spinner(f"正在推送 {len(samples)} 个样本到 CVAT..."):
                 try:
-                    if label_schema:
+                    if label_schema or review_schema:
+                        push_schema = dict(label_schema) if label_schema else {}
+                        if not push_schema:
+                            entry: dict = {}
+                            if single_label_type:
+                                entry["type"] = single_label_type
+                            if selected_classes:
+                                entry["classes"] = selected_classes
+                            if single_push_attrs:
+                                entry["attributes"] = single_push_attrs
+                            push_schema[single_label_field] = entry
+                        if review_schema:
+                            push_schema.update(review_schema)
                         result = cvat_sync.push_to_cvat(
                             samples, anno_key,
-                            label_schema=label_schema,
+                            label_schema=push_schema,
                             segment_size=segment_size,
                             image_quality=image_quality,
                         )
@@ -1394,7 +1436,11 @@ def _render_cvat_push(ds):
                         )
                     st.success("✅ 推送成功")
                     st.json(result)
-                    st.info("💡 现在可以在 CVAT 中进行标注，完成后回到「从 CVAT 拉取」页面同步结果。")
+                    if review_schema:
+                        st.info("💡 废弃标记已启用。标注员可在 CVAT 的 Tag 面板中选择 **discard** 标记废弃图片。"
+                                "完成后回到「从 CVAT 拉取」同步结果，再到「任务状态与审核」处理废弃图片。")
+                    else:
+                        st.info("💡 现在可以在 CVAT 中进行标注，完成后回到「从 CVAT 拉取」页面同步结果。")
                 except Exception as e:
                     st.error(f"推送失败: {e}")
 
@@ -1476,6 +1522,214 @@ def _render_cvat_manage(ds):
                     st.error(f"删除失败: {e}")
     else:
         st.info("暂无标注运行记录。推送数据到 CVAT 后会在此显示。")
+
+
+def _render_cvat_review(ds):
+    st.subheader("任务状态与审核")
+
+    runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+    if not runs:
+        st.info("暂无标注运行记录。请先推送数据到 CVAT。")
+        return
+
+    # ==== Job 状态查看 ====
+    st.markdown("### 📊 Job 状态查看")
+    st.caption(
+        "CVAT 中每个 Task 会按 segment_size 切分为多个 Job，每个 Job 有独立的标注状态。\n\n"
+        "- **State（完成状态）**: new → in progress → completed / rejected\n"
+        "- **Stage（工作阶段）**: annotation → validation → acceptance"
+    )
+
+    selected_key = st.selectbox("选择标注运行", runs, key="review_anno_key")
+
+    if st.button("🔍 查询 Job 状态", key="btn_query_jobs"):
+        with st.spinner("正在查询 CVAT Job 状态..."):
+            try:
+                jobs = cvat_sync.get_job_details(ds, selected_key)
+                if jobs:
+                    import pandas as pd
+                    df = pd.DataFrame([{
+                        "Job ID": j["job_id"],
+                        "Task ID": j["task_id"],
+                        "状态 (state)": j["state"],
+                        "阶段 (stage)": j["stage"],
+                        "标注员": j["assignee"],
+                        "帧范围": f"{j['start_frame']}–{j['stop_frame']}",
+                        "样本数": j["num_samples"],
+                    } for j in jobs])
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+
+                    state_counts: dict[str, int] = {}
+                    stage_counts: dict[str, int] = {}
+                    for j in jobs:
+                        state_counts[j["state"]] = state_counts.get(j["state"], 0) + 1
+                        stage_counts[j["stage"]] = stage_counts.get(j["stage"], 0) + 1
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**按 State 统计：**")
+                        for s, c in state_counts.items():
+                            st.text(f"  {s}: {c} 个 Job")
+                    with col2:
+                        st.markdown("**按 Stage 统计：**")
+                        for s, c in stage_counts.items():
+                            st.text(f"  {s}: {c} 个 Job")
+
+                    st.session_state["_review_jobs"] = jobs
+                else:
+                    st.warning("未找到任何 Job")
+            except Exception as e:
+                st.error(f"查询失败: {e}")
+
+    st.markdown("---")
+
+    # ==== 按 Job 状态标记样本 ====
+    st.markdown("### 🏷️ 按 Job 状态标记样本")
+    st.caption(
+        "将 CVAT Job 的 state 和 stage 信息作为标签写入 FiftyOne 样本。"
+        "标记后可在「数据导出」中按标签筛选，仅导出已完成/已验收的数据。"
+    )
+
+    tag_prefix = st.text_input("标签前缀", value="job", key="review_tag_prefix",
+                               help="标签格式为 `{前缀}_{state}` 和 `{前缀}_{stage}`，如 job_completed、job_acceptance")
+
+    if st.button("🏷️ 标记样本", key="btn_tag_by_status"):
+        with st.spinner("正在标记..."):
+            try:
+                tagged = cvat_sync.tag_samples_by_job_status(ds, selected_key, tag_prefix=tag_prefix)
+                if tagged:
+                    st.success("✅ 标记完成")
+                    for tag, count in tagged.items():
+                        st.text(f"  {tag}: {count} 个样本")
+                else:
+                    st.warning("无法标记：可能缺少 frame_id_map 映射信息（FiftyOne 版本需支持此属性）")
+            except Exception as e:
+                st.error(f"标记失败: {e}")
+
+    st.markdown("---")
+
+    # ==== 按状态筛选样本 ====
+    st.markdown("### 🔎 按 Job 状态筛选样本")
+    st.caption("筛选满足特定 Job 状态的样本，可用于在 FiftyOne App 中查看或作为导出前的检查。")
+
+    col_s, col_g = st.columns(2)
+    with col_s:
+        filter_states = st.multiselect(
+            "筛选 State（留空=不过滤）",
+            ["new", "in progress", "completed", "rejected"],
+            default=["completed"],
+            key="review_filter_states",
+        )
+    with col_g:
+        filter_stages = st.multiselect(
+            "筛选 Stage（留空=不过滤）",
+            ["annotation", "validation", "acceptance"],
+            key="review_filter_stages",
+        )
+
+    if st.button("🔎 筛选并在 FiftyOne 中查看", key="btn_filter_jobs"):
+        with st.spinner("正在筛选..."):
+            try:
+                view = cvat_sync.get_samples_by_job_status(
+                    ds, selected_key,
+                    states=filter_states or None,
+                    stages=filter_stages or None,
+                )
+                count = len(view)
+                st.info(f"符合条件的样本: **{count}** 个")
+                if count > 0:
+                    session = dm.get_session()
+                    if session:
+                        dm.set_session_view(view)
+                        st.success("✅ 已在 FiftyOne App 中展示筛选结果")
+                    else:
+                        st.warning("请先启动 FiftyOne App（在侧边栏点击「启动 FiftyOne App」）")
+            except Exception as e:
+                st.error(f"筛选失败: {e}")
+
+    st.markdown("---")
+
+    # ==== 废弃图片管理 ====
+    st.markdown("### 🗑️ 废弃图片管理")
+    st.caption(
+        "管理在 CVAT 中被标记为 **discard** 的图片。\n\n"
+        "**使用流程**：推送时勾选「启用废弃标记」→ 标注员在 CVAT Tag 面板选择 discard → 拉取后在此处理。"
+    )
+
+    review_field = cvat_sync.REVIEW_FIELD
+    schema = ds.get_field_schema()
+
+    if review_field not in schema:
+        st.info(
+            f"当前数据集没有 `{review_field}` 字段。\n\n"
+            "**如何启用**：在「推送到 CVAT」时勾选「启用废弃标记」，推送后标注员即可在 CVAT 中标记废弃图片。"
+            "标注完成拉取后，此处将显示废弃图片列表和处理选项。"
+        )
+    else:
+        try:
+            discarded = cvat_sync.find_discarded_samples(ds, review_field)
+            discard_count = len(discarded)
+        except Exception as e:
+            st.error(f"检测废弃样本失败: {e}")
+            return
+
+        if discard_count == 0:
+            st.success("✅ 没有被标记为废弃的样本")
+        else:
+            st.warning(f"发现 **{discard_count}** 个被标记为废弃的样本")
+
+            if st.button("👁️ 在 FiftyOne App 中查看废弃样本", key="btn_view_discarded"):
+                session = dm.get_session()
+                if session:
+                    dm.set_session_view(discarded)
+                    st.success("✅ 已在 FiftyOne App 中展示废弃样本")
+                else:
+                    st.warning("请先启动 FiftyOne App")
+
+            discard_action = st.radio(
+                "处理方式",
+                ["仅打标签", "从数据集移除（保留文件）", "从数据集移除并删除文件"],
+                key="discard_action",
+                horizontal=True,
+            )
+
+            action_map = {
+                "仅打标签": "tag",
+                "从数据集移除（保留文件）": "remove",
+                "从数据集移除并删除文件": "remove_and_delete",
+            }
+
+            tag_name = "discarded"
+            if discard_action == "仅打标签":
+                tag_name = st.text_input("标签名", value="discarded", key="discard_tag_name",
+                                         help="废弃样本将被打上此标签，后续导出时可排除带有此标签的样本")
+
+            action = action_map[discard_action]
+            can_proceed = True
+
+            if action in ("remove", "remove_and_delete"):
+                st.error(
+                    f"⚠️ 即将{'删除文件并' if action == 'remove_and_delete' else ''}"
+                    f"从数据集移除 **{discard_count}** 个样本，此操作不可逆！"
+                )
+                confirm = st.text_input(
+                    f"请输入数字 `{discard_count}` 确认操作", key="discard_confirm",
+                    placeholder=f"输入 {discard_count} 确认",
+                )
+                can_proceed = confirm == str(discard_count)
+
+            if st.button("✅ 执行处理", key="btn_handle_discard", disabled=not can_proceed):
+                with st.spinner("处理中..."):
+                    try:
+                        result = cvat_sync.handle_discarded_samples(
+                            ds, review_field, action=action, tag_name=tag_name,
+                        )
+                        st.success(f"✅ 处理完成：{result['action']} 了 {result['count']} 个样本")
+                        if action != "tag":
+                            st.session_state["_toast_msg"] = f"已处理 {result['count']} 个废弃样本"
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"处理失败: {e}")
 
 
 # ===================================================================
