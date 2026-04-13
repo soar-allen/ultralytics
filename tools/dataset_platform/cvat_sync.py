@@ -290,10 +290,10 @@ def push_to_cvat(
                 ) from e
             else:
                 raise ValueError(
-                    "CVAT 组织不匹配：当前未设置组织，但 CVAT 端存在同名项目属于某个组织。\n"
-                    "解决办法：\n"
-                    "1. 在侧边栏「CVAT 配置 → Organization」中填写正确的组织 slug\n"
-                    "2. 或使用不同的项目名称推送到个人空间\n"
+                    f"CVAT 组织不匹配：当前未设置组织，但 CVAT 端存在同名项目 '{project_name}' 属于某个组织。\n"
+                    "解决办法（任选其一）：\n"
+                    "1. 在侧边栏「CVAT 配置 → Organization」中填写正确的组织 slug，继续推送到该组织\n"
+                    "2. 在推送页面的「CVAT 项目名」中填写一个不同的名称，推送到个人空间\n"
                     "可通过「测试 CVAT 连接」查看你的账号所属组织。"
                 ) from e
         if "already exists" in err_msg or "anno_key" in err_msg:
@@ -360,6 +360,69 @@ def push_keypoints_to_cvat(
 # 从 CVAT 拉取
 # ===================================================================
 
+def _fix_invalid_anno_fields(ds: fo.Dataset, anno_key: str) -> list[tuple[str, str]]:
+    """修补存储在标注运行配置中以下划线开头的非法字段名。
+
+    FiftyOne 不允许用户字段名以 ``_`` 开头，早期版本推送的 ``_review``
+    会导致拉取时报 ``Invalid field name``。此函数尝试直接修改底层
+    MongoDB 文档，将非法名重命名后保存。
+
+    Returns:
+        成功重命名的 ``(旧名, 新名)`` 列表；修改失败时返回空列表。
+    """
+    renamed: list[tuple[str, str]] = []
+    try:
+        doc = getattr(ds, "_doc", None)
+        if doc is None:
+            return renamed
+
+        runs = getattr(doc, "annotation_runs", None)
+        if runs is None:
+            runs = getattr(doc, "runs", {})
+        if anno_key not in runs:
+            return renamed
+
+        run_doc = runs[anno_key]
+        config = getattr(run_doc, "config", None)
+        if config is None:
+            return renamed
+
+        if isinstance(config, dict):
+            schema = config.get("label_schema", {})
+        elif hasattr(config, "label_schema"):
+            schema = config.label_schema
+        else:
+            return renamed
+
+        if not isinstance(schema, dict):
+            return renamed
+
+        for key in list(schema.keys()):
+            if key.startswith("_"):
+                new_key = key.lstrip("_") or "review_field"
+                schema[new_key] = schema.pop(key)
+                renamed.append((key, new_key))
+
+        if not renamed:
+            return renamed
+
+        if isinstance(config, dict):
+            config["label_schema"] = schema
+        else:
+            config.label_schema = schema
+
+        if hasattr(run_doc, "save"):
+            run_doc.save()
+        elif hasattr(doc, "save"):
+            doc.save()
+
+        logger.info("已修复标注运行 '%s' 中的无效字段名: %s", anno_key, renamed)
+    except Exception as exc:
+        logger.warning("自动修复字段名失败: %s", exc)
+        renamed = []
+    return renamed
+
+
 def pull_from_cvat(
     samples: fo.Dataset | fo.DatasetView,
     anno_key: str,
@@ -388,7 +451,30 @@ def pull_from_cvat(
         ds.load_annotations(anno_key, cleanup=cleanup, **_get_cvat_cred_kwargs())
     except Exception as e:
         err_msg = str(e).lower()
-        if "connection" in err_msg or "connect" in err_msg:
+
+        if "invalid field name" in err_msg:
+            renamed = _fix_invalid_anno_fields(ds, anno_key)
+            if renamed:
+                logger.info("字段名已修复 %s，重试拉取...", renamed)
+                try:
+                    ds.load_annotations(anno_key, cleanup=cleanup, **_get_cvat_cred_kwargs())
+                except Exception as retry_err:
+                    raise ValueError(
+                        f"自动修复字段名后重试仍然失败: {retry_err}\n"
+                        "解决办法：\n"
+                        "1. 在「管理标注运行」中删除此 anno_key（不勾选「同时清理 CVAT 端」）\n"
+                        "2. 重新推送数据到 CVAT\n"
+                        "   CVAT 端的标注数据不会丢失，可在 CVAT 中继续使用"
+                    ) from retry_err
+            else:
+                raise ValueError(
+                    "标注结果中包含非法字段名（以下划线开头），自动修复失败。\n"
+                    "解决办法：\n"
+                    "1. 在「管理标注运行」中删除此 anno_key（不勾选「同时清理 CVAT 端」）\n"
+                    "2. 重新推送数据到 CVAT（新版本已修复字段名问题）\n"
+                    "   CVAT 端的标注数据不会丢失，可在 CVAT 中继续使用"
+                ) from e
+        elif "connection" in err_msg or "connect" in err_msg:
             raise ConnectionError(
                 f"无法连接 CVAT 服务器 ({CONFIG.cvat.url})。\n"
                 "解决办法：\n"
@@ -396,24 +482,27 @@ def pull_from_cvat(
                 "2. 检查 URL 和端口是否正确\n"
                 "3. 使用「连接测试」按钮验证连通性"
             ) from e
-        if "401" in err_msg or "auth" in err_msg:
+        elif "401" in err_msg or "auth" in err_msg:
             raise PermissionError(
                 "CVAT 认证失败。\n"
                 "解决办法：检查侧边栏中的用户名和密码"
             ) from e
-        if "404" in err_msg or "not found" in err_msg:
+        elif "404" in err_msg or "not found" in err_msg:
             raise ValueError(
                 f"CVAT 端的标注任务不存在（可能已被删除）。\n"
                 "解决办法：\n"
                 "1. 在「管理标注运行」中删除此 anno_key 记录\n"
                 "2. 重新推送数据并创建新的标注任务"
             ) from e
-        raise
+        else:
+            raise
 
     info = {
         "anno_key": anno_key,
         "status": "loaded",
     }
+    if hasattr(ds, "_renamed_fields"):
+        info["renamed_fields"] = ds._renamed_fields
     logger.info("拉取完成: %s", info)
     return info
 
@@ -477,7 +566,7 @@ def get_annotation_status(ds: fo.Dataset, anno_key: str) -> dict:
 # Job 级别状态查询
 # ===================================================================
 
-REVIEW_FIELD = "_review"
+REVIEW_FIELD = "review_status"
 REVIEW_CLASSES = ["discard"]
 
 

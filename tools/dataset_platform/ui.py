@@ -1165,6 +1165,15 @@ def _render_cvat_push(ds):
         help="标注任务的唯一 ID，拉取标注时需要用同一个 key 匹配。每次推送必须使用不同的 key。",
     )
 
+    custom_project = st.text_input(
+        "CVAT 项目名（可选）", key="push_project_name",
+        placeholder=f"留空则使用数据集名称: {ds.name}",
+        help=(
+            "CVAT 中的 Project 名称。如果之前推送到了某个组织空间并创建了同名项目，"
+            "后续向个人空间推送时需要使用不同的项目名，否则会因名称冲突报错。"
+        ),
+    )
+
     # -- 标签字段配置 --
     info = dm.get_dataset_info(ds)
     label_fields = info.get("label_fields", [])
@@ -1313,12 +1322,23 @@ def _render_cvat_push(ds):
         "启用废弃标记（允许标注员在 CVAT 中标记需废弃的图片）",
         value=False,
         key="push_include_review",
-        help=(
-            "勾选后在 CVAT 任务中添加 'discard' 标签选项。"
-            "标注员可在 CVAT 的 Tag 面板中选择 discard 来标记质量差的图片。"
-            "拉取后可在「任务状态与审核」中统一处理废弃图片。"
-        ),
+        help="勾选后在 CVAT 任务中添加 'discard' 标签选项，标注员可在标注时标记废弃图片",
     )
+    if include_review:
+        with st.expander("📖 标注员如何在 CVAT 中标记废弃图片", expanded=True):
+            st.markdown("""
+**推送后，标注员在 CVAT 中的操作步骤：**
+
+1. 打开对应的标注任务，进入标注界面
+2. 在顶部工具栏找到标注模式切换区（左上角），点击 **「Tag」** 图标（标签模式，紧挨在矩形/多边形工具右侧）
+3. 在左侧标签列表中选择 **`discard`**
+4. 浏览图片，遇到需要废弃的图片时直接点击画面即可为该帧添加 `discard` 标签
+5. 切回 **「Shape」** 模式继续正常标注其他图片
+
+> **提示**：标注员也可以在右侧面板的「Objects」区域看到已添加的标签，右键可删除误标。
+
+**标注完成后：** 在本平台「从 CVAT 拉取」同步结果 → 到「任务状态与审核」Tab 处理废弃图片。
+            """)
 
     # -- 多字段提示 --
     is_multi_field = label_schema is not None and len(label_schema) > 1
@@ -1371,6 +1391,7 @@ def _render_cvat_push(ds):
             {cvat_sync.REVIEW_FIELD: {"type": "classifications", "classes": cvat_sync.REVIEW_CLASSES}}
             if include_review else {}
         )
+        push_project_name = custom_project.strip() or None
 
         if is_multi_field:
             # 多字段模式：逐字段推送，每个字段独立 anno_key 和 CVAT 任务
@@ -1387,6 +1408,7 @@ def _render_cvat_push(ds):
                         r = cvat_sync.push_to_cvat(
                             samples, field_key,
                             label_schema=push_schema,
+                            project_name=push_project_name,
                             segment_size=segment_size,
                             image_quality=image_quality,
                         )
@@ -1421,6 +1443,7 @@ def _render_cvat_push(ds):
                         result = cvat_sync.push_to_cvat(
                             samples, anno_key,
                             label_schema=push_schema,
+                            project_name=push_project_name,
                             segment_size=segment_size,
                             image_quality=image_quality,
                         )
@@ -1429,6 +1452,7 @@ def _render_cvat_push(ds):
                             samples, anno_key,
                             label_field=single_label_field,
                             label_type=single_label_type,
+                            project_name=push_project_name,
                             segment_size=segment_size,
                             image_quality=image_quality,
                             classes=selected_classes or None,
@@ -1655,6 +1679,15 @@ def _render_cvat_review(ds):
         "管理在 CVAT 中被标记为 **discard** 的图片。\n\n"
         "**使用流程**：推送时勾选「启用废弃标记」→ 标注员在 CVAT Tag 面板选择 discard → 拉取后在此处理。"
     )
+
+    with st.expander("📖 标注员如何在 CVAT 中标记废弃图片"):
+        st.markdown("""
+1. 打开对应的 CVAT 标注任务
+2. 在顶部工具栏左上角，点击 **「Tag」** 图标切换到标签模式（紧挨在 Shape 工具右侧）
+3. 在左侧标签列表选择 **`discard`**
+4. 点击画面即可为当前帧添加废弃标签
+5. 切回 **「Shape」** 模式继续标注其他图片
+        """)
 
     review_field = cvat_sync.REVIEW_FIELD
     schema = ds.get_field_schema()

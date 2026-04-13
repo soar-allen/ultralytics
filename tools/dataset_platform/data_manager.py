@@ -429,8 +429,8 @@ def _is_session_alive() -> bool:
         return False
 
 
-def launch_app(ds: fo.Dataset, port: Optional[int] = None, address: str = "0.0.0.0") -> fo.Session:
-    """启动或更新 FiftyOne App 会话。address='0.0.0.0' 确保 iframe 可正常访问。"""
+def launch_app(ds: fo.Dataset, port: Optional[int] = None, address: str = "localhost") -> fo.Session:
+    """启动或更新 FiftyOne App 会话。"""
     global _session
     port = port or CONFIG.fiftyone_port
     if not _is_session_alive():
