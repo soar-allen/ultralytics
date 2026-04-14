@@ -22,7 +22,7 @@ tools/dataset_platform/
 ├── processor.py       # 自动化处理与清洗
 ├── cvat_sync.py       # CVAT 双向同步模块
 ├── exporter.py        # 多格式导出模块
-├── advanced.py        # 难例挖掘与版本控制
+├── advanced.py        # 难例挖掘与完整数据集备份
 ├── config.py          # 全局配置
 ├── requirements.txt   # 依赖列表
 └── README.md
@@ -30,11 +30,17 @@ tools/dataset_platform/
 
 ## 功能模块
 
-### 1. Data Hub — 多数据集管理与查看
+### 1. Data Hub — 数据集管理中心
 
 - 侧边栏数据集列表切换、新建、重命名、删除
-- 内嵌 FiftyOne App 交互式可视化
-- 标签统计与分布图表
+- **数据集统计仪表盘**：样本总数、标注实例数、Tags 种类数等概览指标
+- **标注类别统计**：每个标签字段的类别分布图表
+- **Tags 统计**：样本标签分布可视化
+- **标签筛选与查看**：按 Tags 筛选样本，支持在 FiftyOne（新页面跳转）或 CVAT 中查看
+- **CVAT Job 状态刷新**：一键同步 CVAT 最新 Job 状态到样本 Tags
+- **标签管理**：样本 Tags 批量增删、标注类别重命名、标注统计
+- **路径诊断**：图片路径健康检查与批量修复
+- FiftyOne App 跳转到新浏览器标签页查看完整数据集
 
 ### 2. 数据导入 (Ingestion)
 
@@ -53,17 +59,24 @@ tools/dataset_platform/
 - **无标注清理**: 一键删除无标签图像
 - **异常检测**: 扫描损坏/尺寸异常图像
 - **去重**: 精确哈希 + 近似嵌入 (CLIP/DINOv2) 双模式
+- **多边形处理**: 多边形转四角、边界多边形检测
 - **字段合并**: 将分批导入到不同字段的标注合并到统一字段
-- **自动预标注**: 支持 YOLO detect / pose / obb 三种任务
 
-### 4. CVAT 双向同步 (Annotation Sync)
+### 4. 自动预标注 (Auto Pre-labeling)
+
+独立大页面，使用 YOLO 模型对数据集进行自动预标注：
+- 支持 **detect / pose / obb** 三种任务类型
+- 灵活的预标注范围：仅无标注样本、整个数据集、按 Tags 筛选
+- 预标注结果可推送到 CVAT 辅助人工标注，或用于难例挖掘评估
+
+### 5. CVAT 双向同步 (Annotation Sync)
 
 - **映射关系**: Dataset↔Project, View→Task, 自动切分→Jobs
 - **推送**: 支持 detections / polylines / keypoints / classifications
 - **拉取**: 按 anno_key 版本管理标注结果
 - **管理**: 查看/删除标注运行
 
-### 5. 数据导出 (Exporting)
+### 6. 数据导出 (Exporting)
 
 
 | 格式                  | 输出                                  |
@@ -80,10 +93,11 @@ tools/dataset_platform/
 **四边形转 Pose 说明**：将 Polylines 中的 4 点多边形自动排序为 tl→tr→br→bl，  
 包围框从顶点外扩计算，贴近图像边界的关键点标记为 occluded (v=0)。
 
-### 6. 高级功能
+### 7. 高级功能
 
 - **难例挖掘**: 对比 ground_truth 与 predictions，找出高错误率样本
-- **版本控制**: clone 快照备份 / 恢复 / 列表管理
+- **完整数据集备份**: 复制图像文件 + 导出 FiftyOne 元数据与标注，支持从备份恢复
+- 旧版快照管理（FiftyOne clone）仍可用，作为轻量级元数据备份
 
 ## 多批次数据集管理最佳实践
 

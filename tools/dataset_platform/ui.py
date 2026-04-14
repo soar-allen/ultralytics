@@ -3,12 +3,13 @@ Streamlit 前端交互界面。
 
 功能区：
   1. 侧边栏：数据集切换、新建/重命名/删除
-  2. Data Hub：FiftyOne App 嵌入查看
+  2. Data Hub：数据集统计、标签管理、Tags 筛选、FiftyOne/CVAT 查看
   3. 数据导入：多格式支持
   4. 数据清洗与处理
-  5. CVAT 双向同步
-  6. 多格式导出
-  7. 高级功能：难例挖掘、版本控制
+  5. 自动预标注（独立大页面）
+  6. CVAT 双向同步
+  7. 多格式导出
+  8. 高级功能：难例挖掘、完整备份
 
 启动方式：
     streamlit run tools/dataset_platform/ui.py
@@ -334,37 +335,53 @@ def _render_sidebar():
 
 
 # ===================================================================
-# Tab 1: Data Hub - 查看
+# Tab 1: Data Hub - 数据集统计与管理中心
 # ===================================================================
 
 def _render_data_hub():
-    st.header("🔍 Data Hub - 数据集查看")
+    st.header("📊 Data Hub - 数据集管理中心")
     ds = _get_ds()
     if ds is None:
         st.info("请先在侧边栏选择或创建数据集")
         return
 
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        st.subheader("数据集信息")
-        info = dm.get_dataset_info(ds)
-        st.json(info)
+    info = dm.get_dataset_info(ds)
 
-        if info["label_fields"]:
-            selected_field = st.selectbox("选择标签字段查看统计", info["label_fields"])
-            if selected_field:
-                stats = dm.get_label_stats(ds, selected_field)
-                if stats:
-                    import pandas as pd
-                    df = pd.DataFrame(
-                        list(stats.items()), columns=["类别", "数量"]
-                    ).sort_values("数量", ascending=False)
-                    st.dataframe(df, use_container_width=True)
-                    st.bar_chart(df.set_index("类别"))
+    tab_stats, tab_tags_filter, tab_label_mgmt = st.tabs([
+        "📊 数据集统计", "🔎 标签筛选与查看", "🏷️ 标签管理",
+    ])
 
-    with col1:
-        st.subheader("FiftyOne 可视化")
-        port = st.session_state.fo_port
+    with tab_stats:
+        _render_hub_statistics(ds, info)
+    with tab_tags_filter:
+        _render_hub_tag_filter(ds, info)
+    with tab_label_mgmt:
+        _render_label_management(ds)
+
+
+def _render_hub_statistics(ds, info: dict):
+    """数据集统计仪表盘。"""
+    import pandas as pd
+
+    # --- 概览指标 ---
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("📷 样本总数", info["num_samples"])
+    col_m2.metric("🏷️ 标签字段数", len(info["label_fields"]))
+    col_m3.metric("🔖 Tags 种类", len(info["tags"]))
+    total_labels = 0
+    for lf in info["label_fields"]:
+        stats = dm.get_label_stats(ds, lf)
+        total_labels += sum(stats.values()) if stats else 0
+    col_m4.metric("📝 标注实例总数", total_labels)
+
+    # --- FiftyOne 查看入口 ---
+    st.markdown("---")
+    port = st.session_state.fo_port
+    fo_col1, fo_col2 = st.columns([3, 1])
+    with fo_col1:
+        st.subheader("🔍 在 FiftyOne 中查看完整数据集")
+        st.caption("点击下方按钮启动 FiftyOne App，将在新浏览器标签页中打开可视化界面")
+    with fo_col2:
         if st.button("🚀 启动 / 刷新 FiftyOne App", key="btn_launch_fo"):
             try:
                 session = dm.launch_app(ds, port=port)
@@ -372,51 +389,157 @@ def _render_data_hub():
                 st.success(f"FiftyOne App 已启动 (端口 {port})")
             except Exception as e:
                 st.error(f"启动失败: {e}")
+        fo_url = f"http://localhost:{port}"
+        st.link_button("🌐 打开 FiftyOne 查看", fo_url)
 
-        st.components.v1.iframe(
-            f"http://localhost:{port}",
-            height=700,
-            scrolling=True,
+    # --- Label 统计 ---
+    st.markdown("---")
+    st.subheader("📊 标注类别统计")
+
+    if info["label_fields"]:
+        for lf in info["label_fields"]:
+            field_type = dm.get_field_label_type(ds, lf)
+            type_display = {"detections": "矩形框", "polylines": "多边形",
+                            "keypoints": "关键点", "classifications": "分类"}.get(field_type, field_type or "未知")
+            with st.expander(f"**`{lf}`** — {type_display}", expanded=len(info["label_fields"]) <= 3):
+                stats = dm.get_label_stats(ds, lf)
+                if stats:
+                    df = pd.DataFrame(
+                        list(stats.items()), columns=["类别", "数量"]
+                    ).sort_values("数量", ascending=False)
+
+                    chart_col, table_col = st.columns([2, 1])
+                    with chart_col:
+                        st.bar_chart(df.set_index("类别"))
+                    with table_col:
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.caption(f"共 **{len(stats)}** 个类别，**{sum(stats.values())}** 个实例")
+                else:
+                    st.info("该字段暂无标注数据")
+    else:
+        st.info("当前数据集没有标签字段，请先导入标注数据")
+
+    # --- Tags 统计 ---
+    st.markdown("---")
+    st.subheader("🔖 样本 Tags 统计")
+
+    available_tags = ds.distinct("tags")
+    if available_tags:
+        tag_counts = ds.count_values("tags")
+        if tag_counts:
+            df_tags = pd.DataFrame(
+                list(tag_counts.items()), columns=["标签", "样本数"]
+            ).sort_values("样本数", ascending=False)
+
+            chart_col, table_col = st.columns([2, 1])
+            with chart_col:
+                st.bar_chart(df_tags.set_index("标签"))
+            with table_col:
+                st.dataframe(df_tags, use_container_width=True, hide_index=True)
+                st.caption(f"共 **{len(tag_counts)}** 种标签")
+    else:
+        st.info("当前数据集没有任何样本 Tags")
+
+    # --- 数据集元信息 ---
+    with st.expander("📋 数据集完整元信息", expanded=False):
+        st.json(info)
+
+
+def _render_hub_tag_filter(ds, info: dict):
+    """通用 Tags 筛选，并在 FiftyOne 或 CVAT 中查看。"""
+    st.subheader("🔎 按 Tags 筛选样本")
+    st.caption(
+        "选择一个或多个 Tags 筛选样本，然后可以在 FiftyOne 中查看或直接在 CVAT 中打开对应任务。\n\n"
+        "Tags 来源包括：导入时的批次标签、CVAT Job 状态标记、手动添加的标签等。"
+    )
+
+    available_tags = ds.distinct("tags")
+    if not available_tags:
+        st.info("当前数据集没有任何 Tags。可以在「标签管理」中添加，或在导入数据时指定批次标签。")
+        return
+
+    selected_tags = st.multiselect(
+        "选择 Tags（多选为 OR 关系，匹配任一即保留）",
+        available_tags,
+        key="hub_filter_tags",
+    )
+
+    if selected_tags:
+        filtered_view = ds.match_tags(selected_tags)
+        st.info(f"筛选结果: **{len(filtered_view)}** 个样本（共 {len(ds)} 个）")
+
+        if len(filtered_view) == 0:
+            st.warning("没有匹配的样本")
+            return
+
+        col_fo, col_cvat = st.columns(2)
+        with col_fo:
+            st.markdown("**在 FiftyOne 中查看**")
+            if st.button("👁️ 在 FiftyOne App 中展示筛选结果", key="hub_fo_view"):
+                session = dm.get_session()
+                if session:
+                    dm.set_session_view(filtered_view)
+                    st.success("✅ 已更新 FiftyOne App 视图为筛选结果")
+                    port = st.session_state.fo_port
+                    st.link_button("🌐 打开 FiftyOne 查看", f"http://localhost:{port}")
+                else:
+                    st.warning("请先在「数据集统计」Tab 中启动 FiftyOne App")
+
+        with col_cvat:
+            st.markdown("**在 CVAT 中查看**")
+            st.caption("如果这些样本已推送到 CVAT，可以直接跳转到 CVAT 对应任务查看。")
+            runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+            if runs:
+                cvat_url = CONFIG.cvat.url.rstrip("/")
+                st.link_button("🔗 打开 CVAT 面板", f"{cvat_url}/tasks")
+            else:
+                st.caption("当前数据集暂无 CVAT 标注运行，需先在「CVAT 同步」中推送数据。")
+
+        # 筛选结果的标注统计
+        with st.expander("📊 筛选结果统计", expanded=False):
+            import pandas as pd
+            for lf in info.get("label_fields", []):
+                stats = dm.get_label_stats(filtered_view, lf)
+                if stats:
+                    st.markdown(f"**`{lf}`**")
+                    df = pd.DataFrame(
+                        list(stats.items()), columns=["类别", "数量"]
+                    ).sort_values("数量", ascending=False)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("请在上方选择 Tags 进行筛选")
+
+    # CVAT Job 状态快捷操作
+    st.markdown("---")
+    st.subheader("🔄 CVAT Job 状态标签刷新")
+    st.caption(
+        "如果数据已推送到 CVAT，可以一键从 CVAT 同步最新 Job 状态标签到样本 Tags 中，"
+        "然后通过上方的 Tags 筛选来查看特定状态的样本。"
+    )
+
+    runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+    if runs:
+        refresh_keys = st.multiselect(
+            "选择标注运行", runs, default=runs, key="hub_refresh_keys",
+            help="选择要刷新状态标签的标注运行",
         )
-
-        with st.expander("🔧 图片路径诊断与修复", expanded=False):
-            st.caption("如果 FiftyOne 中图片无法显示，可能是数据库中的文件路径与磁盘不一致")
-            if st.button("🔍 诊断路径", key="btn_diag_path"):
-                with st.spinner("扫描中..."):
-                    diag = dm.diagnose_filepaths(ds)
-                st.session_state["_path_diag"] = diag
-
-            diag = st.session_state.get("_path_diag")
-            if diag:
-                c1, c2, c3 = st.columns(3)
-                c1.metric("总样本数", diag["total"])
-                c2.metric("路径缺失", diag["missing"], delta=None if diag["missing"] == 0 else f"-{diag['missing']}", delta_color="inverse")
-                c3.metric("符号链接", diag["symlinks"])
-
-                if diag["missing"] > 0:
-                    st.error(f"发现 {diag['missing']} 个文件不存在！图片将无法在 FiftyOne 中显示。")
-                    st.caption("缺失路径示例：")
-                    for item in diag["missing_samples"][:5]:
-                        st.code(item["filepath"], language=None)
-
-                    st.markdown("**批量修复路径前缀**")
-                    st.caption("如果图片目录发生了迁移，可以将旧路径前缀替换为新路径")
-                    old_pfx = st.text_input("旧路径前缀", key="fix_old_pfx",
-                                            placeholder="/old/path/to/images")
-                    new_pfx = st.text_input("新路径前缀", key="fix_new_pfx",
-                                            placeholder="/new/path/to/images")
-                    if st.button("🔧 执行路径修复", key="btn_fix_path"):
-                        if old_pfx and new_pfx:
-                            with st.spinner("修复中..."):
-                                fixed = dm.fix_filepaths(ds, old_pfx, new_pfx)
-                            st.session_state["_toast_msg"] = f"已修复 {fixed} 个样本的路径"
-                            if "_path_diag" in st.session_state:
-                                del st.session_state["_path_diag"]
-                            st.rerun()
+        if st.button("🔄 刷新 Job 状态标签", key="hub_refresh_tags"):
+            if refresh_keys:
+                with st.spinner("正在从 CVAT 查询最新 Job 状态并更新标签..."):
+                    try:
+                        tagged = cvat_sync.tag_samples_by_job_status(ds, refresh_keys)
+                        if tagged:
+                            st.success("✅ 标签已更新为最新状态")
+                            for tag, count in tagged.items():
+                                st.text(f"  {tag}: {count} 个样本")
                         else:
-                            st.error("请填写新旧路径前缀")
-                elif diag["total"] > 0:
-                    st.success("所有文件路径均有效")
+                            st.warning("无法标记：可能缺少 frame_id_map 映射信息")
+                    except Exception as e:
+                        st.error(f"刷新失败: {e}")
+            else:
+                st.warning("请先选择标注运行")
+    else:
+        st.info("暂无 CVAT 标注运行。推送数据到 CVAT 后可在此刷新 Job 状态标签。")
 
 
 # ===================================================================
@@ -433,8 +556,12 @@ def _render_ingestion():
     format_choice = st.selectbox(
         "选择导入格式",
         ["A. 纯图片目录", "B. Thoro COCO 格式", "C. Roboflow COCO 格式",
-         "D. Roboflow YOLO 格式", "E. CVAT 1.1 XML 格式"],
+         "D. Roboflow YOLO 格式", "E. CVAT 1.1 XML 格式", "F. 从备份导入"],
     )
+
+    if format_choice.startswith("F"):
+        _render_ingest_from_backup(ds)
+        return
 
     batch_tags_str = st.text_input(
         "批次标签（逗号分隔，用于区分不同批次数据）",
@@ -562,6 +689,62 @@ def _render_ingest_cvat(ds, tags):
             st.error("请输入有效的 XML 文件路径")
 
 
+def _render_ingest_from_backup(ds):
+    st.subheader("F. 从备份导入")
+    st.caption(
+        "从本平台生成的完整备份中导入数据。备份中的图像和标注（包括原始 Tags、标签字段）"
+        "会被追加到当前数据集，已存在的同名文件会自动跳过。\n\n"
+        "**适用场景**：从另一台机器/另一个项目的备份中迁移数据到当前数据集。"
+    )
+
+    backup_dir = _path_browser("备份目录路径", "ingest_backup_dir", mode="dir")
+
+    if backup_dir and Path(backup_dir).is_dir():
+        info_file = Path(backup_dir) / "backup_info.json"
+        if info_file.exists():
+            import json
+            backup_info = json.loads(info_file.read_text(encoding="utf-8"))
+            st.success("✅ 检测到有效备份")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("源数据集", backup_info.get("dataset_name", "未知"))
+            col2.metric("样本数", backup_info.get("num_samples", "?"))
+            col3.metric("图像文件", backup_info.get("images_copied", "?"))
+
+            if backup_info.get("note"):
+                st.info(f"备份备注: {backup_info['note']}")
+            if backup_info.get("label_fields"):
+                st.caption(f"标签字段: {', '.join(backup_info['label_fields'])}")
+            if backup_info.get("tags"):
+                st.caption(f"原始 Tags: {', '.join(backup_info['tags'][:20])}")
+        else:
+            st.warning("所选目录不是有效的备份目录（缺少 backup_info.json）")
+            return
+    else:
+        st.info("请选择备份目录")
+        return
+
+    extra_tags_str = st.text_input(
+        "额外标签（逗号分隔，可选）",
+        key="ingest_backup_tags",
+        placeholder="例如: imported_from_machine2, batch_03",
+        help="除了保留备份中的原始 Tags 外，还可以额外添加标签用于区分来源",
+    )
+    extra_tags = [t.strip() for t in extra_tags_str.split(",") if t.strip()] if extra_tags_str else None
+
+    if st.button("📦 开始导入", key="btn_ingest_backup", type="primary"):
+        with st.spinner("正在从备份导入数据..."):
+            try:
+                result = advanced.import_from_backup(
+                    backup_dir, ds, tags=extra_tags,
+                )
+                st.success("✅ 导入完成")
+                st.json(result)
+                if result["skipped_dup"] > 0:
+                    st.info(f"跳过了 {result['skipped_dup']} 个重复文件（已存在于数据集中）")
+            except Exception as e:
+                st.error(f"导入失败: {e}")
+
+
 # ===================================================================
 # Tab 3: 数据处理与清洗
 # ===================================================================
@@ -573,18 +756,14 @@ def _render_processing():
         st.info("请先选择数据集")
         return
 
-    tab_clean, tab_label, tab_merge, tab_predict = st.tabs(
-        ["🧹 图像清理", "🏷️ 标签管理", "🔀 字段合并", "🤖 自动预标注"],
+    tab_clean, tab_merge = st.tabs(
+        ["🧹 图像清理", "🔀 字段合并"],
     )
 
     with tab_clean:
         _render_cleaning(ds)
-    with tab_label:
-        _render_label_management(ds)
     with tab_merge:
         _render_field_merge(ds)
-    with tab_predict:
-        _render_auto_predict(ds)
 
 
 def _render_bad_polylines(ds):
@@ -644,7 +823,11 @@ def _render_bad_polylines(ds):
             bp_act1, bp_act2 = st.columns(2)
             with bp_act1:
                 bp_del_physical = st.checkbox("同时删除磁盘文件", key="bp_del_physical")
-                if st.button("🗑️ 删除已标记的异常样本", key="btn_del_bad_poly", type="primary"):
+                confirm_bp_del = st.checkbox(
+                    f"⚠️ 确认删除 {bad_count} 个异常样本", key="confirm_del_bad_poly",
+                )
+                if st.button("🗑️ 删除已标记的异常样本", key="btn_del_bad_poly",
+                             type="primary", disabled=not confirm_bp_del):
                     with st.spinner("删除中..."):
                         bad_view = ds.match_tags([bad_tag])
                         ids = bad_view.values("id")
@@ -679,16 +862,21 @@ def _render_cleaning(ds):
     with col1:
         st.subheader("无标注图像")
         unlabeled = processor.find_unlabeled_samples(ds)
-        st.metric("无标注样本数", len(unlabeled))
+        unlabeled_count = len(unlabeled)
+        st.metric("无标注样本数", unlabeled_count)
         physical = st.checkbox("同时删除磁盘文件", key="clean_unlabeled_physical")
-        if st.button("🗑️ 删除无标注样本", key="btn_del_unlabeled"):
-            if len(unlabeled) > 0:
-                with st.spinner("删除中..."):
-                    count = processor.delete_unlabeled_samples(ds, physical=physical)
-                st.success(f"✅ 删除 {count} 个样本")
-                st.rerun()
-            else:
-                st.info("没有无标注样本")
+        if unlabeled_count > 0:
+            confirm_del_unlabeled = st.checkbox(
+                f"⚠️ 确认删除 {unlabeled_count} 个无标注样本", key="confirm_del_unlabeled",
+            )
+        else:
+            confirm_del_unlabeled = False
+        if st.button("🗑️ 删除无标注样本", key="btn_del_unlabeled",
+                     disabled=not confirm_del_unlabeled):
+            with st.spinner("删除中..."):
+                count = processor.delete_unlabeled_samples(ds, physical=physical)
+            st.success(f"✅ 删除 {count} 个样本")
+            st.rerun()
 
     with col2:
         st.subheader("损坏/异常图像")
@@ -701,7 +889,13 @@ def _render_cleaning(ds):
             st.metric("发现异常", len(bad_ids))
 
         if st.session_state.get("corrupt_ids"):
-            if st.button("🗑️ 删除异常样本（含磁盘文件）", key="btn_del_corrupt"):
+            corrupt_count = len(st.session_state["corrupt_ids"])
+            confirm_del_corrupt = st.checkbox(
+                f"⚠️ 确认删除 {corrupt_count} 个异常样本（含磁盘文件）",
+                key="confirm_del_corrupt",
+            )
+            if st.button("🗑️ 删除异常样本（含磁盘文件）", key="btn_del_corrupt",
+                         disabled=not confirm_del_corrupt):
                 from tools.dataset_platform.data_manager import delete_samples_physically
                 count = delete_samples_physically(ds, st.session_state["corrupt_ids"])
                 st.success(f"✅ 物理删除 {count} 个样本")
@@ -725,9 +919,16 @@ def _render_cleaning(ds):
             )
             if del_tags:
                 tag_view = ds.match_tags(del_tags)
-                st.metric("匹配样本数", len(tag_view))
+                tag_match_count = len(tag_view)
+                st.metric("匹配样本数", tag_match_count)
+            else:
+                tag_match_count = 0
             del_physical = st.checkbox("同时删除磁盘文件", key="clean_tag_physical")
-            if st.button("🗑️ 删除匹配样本", key="btn_del_by_tag"):
+            confirm_del_by_tag = st.checkbox(
+                f"⚠️ 确认删除匹配的 {tag_match_count} 个样本", key="confirm_del_by_tag",
+            ) if del_tags and tag_match_count > 0 else False
+            if st.button("🗑️ 删除匹配样本", key="btn_del_by_tag",
+                         disabled=not confirm_del_by_tag):
                 if del_tags:
                     tag_view = ds.match_tags(del_tags)
                     count = len(tag_view)
@@ -804,7 +1005,11 @@ def _render_cleaning(ds):
             dup_col1, dup_col2 = st.columns(2)
             with dup_col1:
                 dup_del_physical = st.checkbox("同时删除磁盘文件", key="dup_del_existing_physical")
-                if st.button("🗑️ 删除已标记的重复样本", key="btn_del_dup_tagged", type="primary"):
+                confirm_del_dup = st.checkbox(
+                    f"⚠️ 确认删除 {dup_count} 个重复样本", key="confirm_del_dup_tagged",
+                )
+                if st.button("🗑️ 删除已标记的重复样本", key="btn_del_dup_tagged",
+                             type="primary", disabled=not confirm_del_dup):
                     with st.spinner("删除中..."):
                         dup_view = ds.match_tags(["duplicate"])
                         ids = dup_view.values("id")
@@ -1069,32 +1274,89 @@ def _render_field_merge(ds):
                 st.error(f"合并失败: {e}")
 
 
-def _render_auto_predict(ds):
-    st.subheader("YOLO 模型自动预标注")
-    model_path = _path_browser(
-        "模型权重路径 (.pt)", "pred_model", mode="file",
-        file_extensions=(".pt", ".pth", ".onnx", ".engine"),
+def _render_auto_predict_page():
+    """独立的自动预标注页面。"""
+    st.header("🤖 自动预标注")
+    ds = _get_ds()
+    if ds is None:
+        st.info("请先选择数据集")
+        return
+
+    st.caption(
+        "使用 YOLO 模型对数据集样本进行自动预标注，生成的标注可作为 CVAT 标注员的预标注参考，"
+        "或用于难例挖掘中与人工标注对比评估。"
     )
-    task = st.selectbox("任务类型", ["detect", "pose", "obb"], key="pred_task")
-    pred_field = st.text_input("预测结果字段名", value="predictions", key="pred_field")
-    conf = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05, key="pred_conf")
 
-    only_unlabeled = st.checkbox("仅对无标注样本预标注", value=True, key="pred_unlabeled_only")
+    info = dm.get_dataset_info(ds)
+    col_overview, col_unlabeled = st.columns(2)
+    with col_overview:
+        st.metric("📷 数据集样本数", info["num_samples"])
+    with col_unlabeled:
+        unlabeled = processor.find_unlabeled_samples(ds)
+        st.metric("🔲 无标注样本数", len(unlabeled))
 
-    if st.button("🚀 开始预标注", key="btn_predict"):
+    st.markdown("---")
+
+    col_model, col_config = st.columns(2)
+
+    with col_model:
+        st.subheader("模型配置")
+        model_path = _path_browser(
+            "模型权重路径 (.pt)", "pred_model", mode="file",
+            file_extensions=(".pt", ".pth", ".onnx", ".engine"),
+        )
+        task = st.selectbox("任务类型", ["detect", "pose", "obb"], key="pred_task",
+                            help="detect=矩形框检测, pose=关键点检测, obb=旋转框检测")
+
+    with col_config:
+        st.subheader("预标注配置")
+        pred_field = st.text_input("预测结果字段名", value="predictions", key="pred_field",
+                                   help="预标注结果会存入此字段，后续可在 FiftyOne 中查看或用于模型评估")
+        conf = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05, key="pred_conf",
+                         help="低于此值的预测将被过滤")
+
+    st.markdown("---")
+
+    st.subheader("预标注范围")
+    pred_scope = st.radio(
+        "选择范围", ["仅无标注样本", "整个数据集", "按 Tags 筛选"],
+        key="pred_scope", horizontal=True,
+    )
+
+    pred_view = None
+    if pred_scope == "仅无标注样本":
+        pred_view = unlabeled
+        st.info(f"将对 **{len(pred_view)}** 个无标注样本进行预标注")
+    elif pred_scope == "按 Tags 筛选":
+        available_tags = ds.distinct("tags")
+        if available_tags:
+            pred_tags = st.multiselect("选择 Tags", available_tags, key="pred_tags")
+            if pred_tags:
+                pred_view = ds.match_tags(pred_tags)
+                st.info(f"将对 **{len(pred_view)}** 个匹配样本进行预标注")
+        else:
+            st.info("当前数据集没有 Tags")
+    else:
+        st.info(f"将对整个数据集的 **{len(ds)}** 个样本进行预标注")
+
+    st.markdown("---")
+    if st.button("🚀 开始预标注", key="btn_predict", type="primary"):
         if model_path and Path(model_path).exists():
-            view = None
-            if only_unlabeled:
-                view = processor.find_unlabeled_samples(ds)
-                st.info(f"将对 {len(view)} 个无标注样本进行预标注")
-
-            with st.spinner(f"使用 {task} 模型预标注中..."):
+            target = pred_view if pred_view is not None else None
+            target_count = len(target) if target is not None else len(ds)
+            with st.spinner(f"使用 {task} 模型对 {target_count} 个样本进行预标注..."):
                 stats = processor.auto_predict_yolo(
                     ds, model_path, pred_field=pred_field,
-                    conf_threshold=conf, task=task, view=view,
+                    conf_threshold=conf, task=task, view=target,
                 )
             st.success("✅ 预标注完成")
             st.json(stats)
+            st.info(
+                "💡 预标注结果已写入字段 `" + pred_field + "`。\n\n"
+                "- 可在 FiftyOne 中查看预标注效果\n"
+                "- 可在「CVAT 同步」中推送预标注到 CVAT 辅助人工标注\n"
+                "- 可在「高级功能 → 难例挖掘」中与人工标注对比评估"
+            )
         else:
             st.error("请输入有效的模型路径")
 
@@ -1501,7 +1763,16 @@ def _render_cvat_pull(ds):
         help="勾选后，拉取完成会同时删除 CVAT 服务器上的对应任务和项目",
     )
 
-    if st.button("📥 拉取标注", key="btn_pull", disabled=not anno_key):
+    if cleanup:
+        st.warning("⚠️ 拉取完成后将**永久删除** CVAT 服务器上的对应任务和项目，此操作不可逆！")
+        confirm_cleanup = st.checkbox(
+            "我确认要在拉取后删除 CVAT 端任务", key="pull_cleanup_confirm",
+        )
+    else:
+        confirm_cleanup = True
+
+    pull_disabled = not anno_key or (cleanup and not confirm_cleanup)
+    if st.button("📥 拉取标注", key="btn_pull", disabled=pull_disabled):
         if not anno_key:
             st.error("请选择标注运行")
             return
@@ -1631,75 +1902,6 @@ def _render_cvat_review(ds):
                         st.warning("未找到任何 Job")
                 except Exception as e:
                     st.error(f"查询失败: {e}")
-
-    st.markdown("---")
-
-    # ==== 刷新 Job 状态标签 ====
-    st.markdown("### 🏷️ 刷新 Job 状态标签")
-    st.caption(
-        "从 CVAT 拉取标注时会**自动**标记 Job 状态标签。"
-        "如果只是在 CVAT 端修改了 Job 状态（如审核通过）但不需要重新拉取标注数据，可以点击下方按钮仅刷新标签。"
-    )
-
-    if st.button("🔄 刷新状态标签（不拉取标注）", key="btn_refresh_tags"):
-        if not selected_keys:
-            st.warning("请先在上方选择标注运行")
-        else:
-            with st.spinner("正在从 CVAT 查询最新 Job 状态并更新标签..."):
-                try:
-                    tagged = cvat_sync.tag_samples_by_job_status(ds, selected_keys)
-                    if tagged:
-                        st.success("✅ 标签已更新为最新状态")
-                        for tag, count in tagged.items():
-                            st.text(f"  {tag}: {count} 个样本")
-                    else:
-                        st.warning("无法标记：可能缺少 frame_id_map 映射信息")
-                except Exception as e:
-                    st.error(f"刷新失败: {e}")
-
-    st.markdown("---")
-
-    # ==== 按状态筛选样本 ====
-    st.markdown("### 🔎 按 Job 状态筛选样本")
-    st.caption("筛选满足特定 Job 状态的样本，可用于在 FiftyOne App 中查看或作为导出前的检查。")
-
-    col_s, col_g = st.columns(2)
-    with col_s:
-        filter_states = st.multiselect(
-            "筛选 State（留空=不过滤）",
-            ["new", "in progress", "completed", "rejected"],
-            default=["completed"],
-            key="review_filter_states",
-        )
-    with col_g:
-        filter_stages = st.multiselect(
-            "筛选 Stage（留空=不过滤）",
-            ["annotation", "validation", "acceptance"],
-            key="review_filter_stages",
-        )
-
-    if st.button("🔎 筛选并在 FiftyOne 中查看", key="btn_filter_jobs"):
-        if not selected_keys:
-            st.warning("请先在上方选择标注运行")
-        else:
-            with st.spinner("正在筛选..."):
-                try:
-                    view = cvat_sync.get_samples_by_job_status(
-                        ds, selected_keys,
-                        states=filter_states or None,
-                        stages=filter_stages or None,
-                    )
-                    count = len(view)
-                    st.info(f"符合条件的样本: **{count}** 个")
-                    if count > 0:
-                        session = dm.get_session()
-                        if session:
-                            dm.set_session_view(view)
-                            st.success("✅ 已在 FiftyOne App 中展示筛选结果")
-                        else:
-                            st.warning("请先启动 FiftyOne App（在侧边栏点击「启动 FiftyOne App」）")
-                except Exception as e:
-                    st.error(f"筛选失败: {e}")
 
     st.markdown("---")
 
@@ -1962,12 +2164,12 @@ def _render_advanced():
         st.info("请先选择数据集")
         return
 
-    tab_hard, tab_snapshot = st.tabs(["🎯 难例挖掘", "📸 版本控制"])
+    tab_hard, tab_backup = st.tabs(["🎯 难例挖掘", "💾 数据集备份"])
 
     with tab_hard:
         _render_hard_mining(ds)
-    with tab_snapshot:
-        _render_snapshots(ds)
+    with tab_backup:
+        _render_backup(ds)
 
 
 def _render_hard_mining(ds):
@@ -2010,47 +2212,108 @@ def _render_hard_mining(ds):
                     st.error(f"挖掘失败: {e}")
 
 
-def _render_snapshots(ds):
-    st.subheader("数据集版本控制（快照）")
+def _render_backup(ds):
+    st.subheader("数据集完整备份")
+    st.caption(
+        "创建数据集的完整备份，包括所有图像文件和标注数据。\n"
+        "与快照（仅克隆 FiftyOne 元数据）不同，完整备份会复制实际的图像文件到备份目录。"
+    )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**创建快照**")
-        note = st.text_input("快照备注", key="snap_note", placeholder="例如: v1.0 发版前备份")
-        suffix = st.text_input("快照后缀（可选，默认时间戳）", key="snap_suffix")
-        if st.button("📸 创建快照", key="btn_snap"):
-            with st.spinner("创建中..."):
-                name = advanced.create_snapshot(
-                    ds.name,
-                    snapshot_suffix=suffix if suffix else None,
-                    note=note,
-                )
-            st.success(f"✅ 快照已创建: {name}")
+    from datetime import datetime as _dt
 
-    with col2:
-        st.markdown("**已有快照**")
-        snapshots = advanced.list_snapshots(ds.name)
-        if snapshots:
-            import pandas as pd
-            df = pd.DataFrame(snapshots)
-            st.dataframe(df[["suffix", "time", "note", "num_samples"]], use_container_width=True)
+    # --- 创建备份 ---
+    st.markdown("### 📦 创建新备份")
+    default_backup_root = str(Path(CONFIG.default_export_dir).parent / "dataset_backups")
+    backup_root = _path_browser("备份根目录", "backup_root", mode="dir", start_dir=default_backup_root)
 
-            snap_name = st.selectbox("选择快照", [s["name"] for s in snapshots], key="snap_select")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if st.button("♻️ 恢复此快照", key="btn_restore"):
-                    st.warning(f"⚠️ 将覆盖当前数据集 '{ds.name}'！")
-                    if st.button("确认恢复", key="btn_confirm_restore"):
-                        advanced.restore_snapshot(snap_name, ds.name)
-                        st.success("✅ 已恢复")
-                        st.rerun()
-            with col_b:
-                if st.button("🗑️ 删除快照", key="btn_del_snap"):
-                    advanced.delete_snapshot(snap_name)
-                    st.success("✅ 已删除")
-                    st.rerun()
+    note = st.text_input("备份备注", key="backup_note", placeholder="例如: v1.0 标注完成后备份")
+
+    backup_name = st.text_input(
+        "备份子目录名（可选，默认为 数据集名_时间戳）",
+        key="backup_name",
+        placeholder=f"{ds.name}_{_dt.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+
+    if st.button("💾 创建完整备份", key="btn_backup", type="primary"):
+        if not backup_root:
+            st.error("请指定备份根目录")
         else:
-            st.info("暂无快照")
+            sub = backup_name.strip() if backup_name.strip() else f"{ds.name}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
+            backup_dir = str(Path(backup_root) / sub)
+            with st.spinner(f"正在备份 {len(ds)} 个样本（包含图像复制）..."):
+                try:
+                    result = advanced.backup_dataset(ds, backup_dir, note=note)
+                    st.success("✅ 完整备份已创建")
+                    st.json(result)
+                    if result["images_failed"] > 0:
+                        st.warning(f"⚠️ 有 {result['images_failed']} 个图像文件复制失败，请检查日志")
+                except Exception as e:
+                    st.error(f"备份失败: {e}")
+
+    st.markdown("---")
+
+    # --- 已有备份列表 ---
+    st.markdown("### 📋 已有备份")
+    if backup_root and Path(backup_root).is_dir():
+        backups = advanced.list_backups(backup_root)
+        if backups:
+            import pandas as pd
+            df = pd.DataFrame(backups)
+            display_cols = [c for c in ["dataset_name", "backup_time", "note", "num_samples",
+                                        "images_copied", "metadata_exported"] if c in df.columns]
+            st.dataframe(df[display_cols] if display_cols else df, use_container_width=True, hide_index=True)
+
+            selected_backup = st.selectbox(
+                "选择备份",
+                [b["path"] for b in backups],
+                format_func=lambda p: f"{Path(p).name} — {next((b.get('note', '') for b in backups if b['path'] == p), '')}",
+                key="backup_select",
+            )
+
+            col_restore, col_delete = st.columns(2)
+            with col_restore:
+                restore_name = st.text_input(
+                    "恢复为数据集名称", value=ds.name, key="backup_restore_name",
+                    help="恢复后的数据集名称，如果与现有数据集同名会覆盖",
+                )
+                if st.button("♻️ 从备份恢复", key="btn_backup_restore"):
+                    st.warning(f"⚠️ 将覆盖数据集 '{restore_name}' 的 FiftyOne 元数据！图像文件保留在备份目录中。")
+
+                confirm_restore = st.text_input(
+                    f"输入 `{restore_name}` 确认恢复", key="backup_restore_confirm",
+                )
+                if st.button("✅ 确认恢复", key="btn_confirm_backup_restore"):
+                    if confirm_restore == restore_name:
+                        with st.spinner("恢复中..."):
+                            try:
+                                advanced.restore_from_backup(selected_backup, restore_name)
+                                st.session_state.current_dataset = restore_name
+                                st.session_state["_toast_msg"] = f"已从备份恢复数据集: {restore_name}"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"恢复失败: {e}")
+                    else:
+                        st.error("名称不匹配，取消恢复")
+
+            with col_delete:
+                st.markdown("**删除备份**")
+                st.caption(f"备份路径: `{selected_backup}`")
+                confirm_del_backup = st.checkbox(
+                    f"⚠️ 确认删除此备份（将永久删除备份目录及其中的所有文件）",
+                    key="confirm_del_backup",
+                )
+                if st.button("🗑️ 删除此备份", key="btn_del_backup",
+                             disabled=not confirm_del_backup):
+                    try:
+                        advanced.delete_backup(selected_backup)
+                        st.session_state["_toast_msg"] = "备份已删除"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"删除失败: {e}")
+        else:
+            st.info("指定目录下暂无备份")
+    else:
+        st.info("请先指定备份根目录以查看已有备份")
 
 
 # ===================================================================
@@ -2063,10 +2326,11 @@ def main():
 
     _render_sidebar()
 
-    tab_hub, tab_import, tab_process, tab_cvat, tab_export, tab_adv = st.tabs([
-        "🔍 Data Hub",
+    tab_hub, tab_import, tab_process, tab_predict, tab_cvat, tab_export, tab_adv = st.tabs([
+        "📊 Data Hub",
         "📥 数据导入",
         "🧹 处理清洗",
+        "🤖 自动预标注",
         "🔄 CVAT 同步",
         "📤 数据导出",
         "🧠 高级功能",
@@ -2078,6 +2342,8 @@ def main():
         _render_ingestion()
     with tab_process:
         _render_processing()
+    with tab_predict:
+        _render_auto_predict_page()
     with tab_cvat:
         _render_cvat_sync()
     with tab_export:
