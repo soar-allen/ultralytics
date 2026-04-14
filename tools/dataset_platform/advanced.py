@@ -53,6 +53,7 @@ def find_hard_samples(
     ds: fo.Dataset,
     eval_key: str = "eval",
     pred_field: str = "predictions",
+    gt_field: str = "ground_truth",
     min_false_positives: int = 1,
     min_false_negatives: int = 1,
     sort_by: str = "total_errors",
@@ -84,7 +85,7 @@ def find_hard_samples(
                     if ev == "fp":
                         fp_count += 1
 
-            gt = sample.get_field("ground_truth")
+            gt = sample.get_field(gt_field)
             if gt and hasattr(gt, "detections") and gt.detections:
                 for det in gt.detections:
                     ev = det.get_attribute_value(eval_key, None)
