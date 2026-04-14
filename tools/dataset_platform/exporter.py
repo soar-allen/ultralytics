@@ -432,18 +432,57 @@ def _compute_kpt_visibility(
     img_w: int,
     img_h: int,
     edge_threshold: float = 5.0,
+    occlusion_flags: Optional[list[bool]] = None,
 ) -> list[int]:
-    """根据关键点到图像边界的距离计算可见性。
+    """根据关键点到图像边界的距离和遮挡属性计算可见性。
+
+    优先级：贴近边界 → v=0（坐标归零）> 被遮挡 → v=1（保留坐标）> 可见 → v=2
+
+    Args:
+        occlusion_flags: 长度与 norm_pts 相同的布尔列表，True 表示该点被遮挡。
+            对应 CVAT 的 1_occu~4_occu 属性（左上/右上/右下/左下）。
 
     Returns:
-        visibility 列表：2=可见, 0=不可见（贴近边界，坐标将归零）
+        visibility 列表：2=可见, 1=被遮挡, 0=不可见（贴近边界，坐标将归零）
     """
     result: list[int] = []
-    for nx, ny in norm_pts:
+    for i, (nx, ny) in enumerate(norm_pts):
         px, py = nx * img_w, ny * img_h
         min_dist = min(px, img_w - px, py, img_h - py)
-        result.append(0 if min_dist < edge_threshold else 2)
+        if min_dist < edge_threshold:
+            result.append(0)
+        elif occlusion_flags and i < len(occlusion_flags) and occlusion_flags[i]:
+            result.append(1)
+        else:
+            result.append(2)
     return result
+
+
+def _get_occlusion_flags(poly) -> list[bool]:
+    """从 polyline 的 CVAT 属性中提取四角遮挡标记 [tl, tr, br, bl]。
+
+    属性名 1_occu~4_occu 分别对应左上、右上、右下、左下角点。
+    """
+    flags: list[bool] = []
+    for i in range(1, 5):
+        attr_name = f"{i}_occu"
+        val = None
+        try:
+            val = getattr(poly, attr_name, None)
+        except Exception:
+            pass
+        if val is None:
+            try:
+                val = poly.get_attribute_value(attr_name)
+            except Exception:
+                pass
+        if isinstance(val, bool):
+            flags.append(val)
+        elif isinstance(val, str):
+            flags.append(val.lower() in ("true", "1", "yes"))
+        else:
+            flags.append(bool(val) if val is not None else False)
+    return flags
 
 
 def _get_image_dims(sample) -> tuple[int, int]:
@@ -526,7 +565,8 @@ def export_yolo_pose_from_polylines(
         yaml.dump(data_yaml, f, default_flow_style=False, allow_unicode=True)
 
     total = 0
-    total_occluded_kpts = 0
+    total_edge_invisible = 0
+    total_occluded = 0
     per_split: dict[str, int] = {}
 
     for split_name, ids in split_ids.items():
@@ -564,8 +604,13 @@ def export_yolo_pose_from_polylines(
 
                 cls_id = class_map[poly.label]
                 ordered = _order_quad_tl_tr_br_bl(pts)
-                vis = _compute_kpt_visibility(ordered, img_w, img_h, edge_threshold)
-                total_occluded_kpts += sum(1 for v in vis if v == 0)
+                occu_flags = _get_occlusion_flags(poly)
+                vis = _compute_kpt_visibility(
+                    ordered, img_w, img_h, edge_threshold,
+                    occlusion_flags=occu_flags if occu_flags else None,
+                )
+                total_edge_invisible += sum(1 for v in vis if v == 0)
+                total_occluded += sum(1 for v in vis if v == 1)
 
                 xs = [p[0] for p in ordered]
                 ys = [p[1] for p in ordered]
@@ -593,13 +638,17 @@ def export_yolo_pose_from_polylines(
         per_split[split_name] = count
         total += count
 
-    logger.info("YOLO Pose (from polylines) 导出: %d 张图片, occluded 关键点: %d", total, total_occluded_kpts)
+    logger.info(
+        "YOLO Pose (from polylines) 导出: %d 张图片, 边界不可见关键点: %d, 遮挡关键点: %d",
+        total, total_edge_invisible, total_occluded,
+    )
     return {
         "exported": total,
         "per_split": per_split,
         "classes": list(class_map.keys()),
         "kpt_shape": [4, 3],
-        "occluded_keypoints": total_occluded_kpts,
+        "edge_invisible_keypoints": total_edge_invisible,
+        "occluded_keypoints": total_occluded,
         "output_dir": str(output_dir),
     }
 

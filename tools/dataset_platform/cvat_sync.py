@@ -497,12 +497,20 @@ def pull_from_cvat(
         else:
             raise
 
-    info = {
+    # 拉取成功后自动按 Job 状态打标签
+    job_tags: dict[str, int] = {}
+    try:
+        job_tags = tag_samples_by_job_status(ds, anno_key)
+        if job_tags:
+            logger.info("已自动标记 Job 状态标签: %s", job_tags)
+    except Exception as tag_err:
+        logger.warning("自动标记 Job 状态标签失败（不影响标注拉取）: %s", tag_err)
+
+    info: dict = {
         "anno_key": anno_key,
         "status": "loaded",
+        "job_tags": job_tags,
     }
-    if hasattr(ds, "_renamed_fields"):
-        info["renamed_fields"] = ds._renamed_fields
     logger.info("拉取完成: %s", info)
     return info
 
@@ -592,6 +600,25 @@ def _cvat_get_paginated(endpoint: str, params: Optional[dict] = None) -> list:
     return results
 
 
+def _extract_sample_id(value) -> Optional[str]:
+    """从 frame_id_map 的值中提取 FiftyOne sample ID。
+
+    不同 FiftyOne 版本中 frame_id_map 的值格式可能不同：
+    字符串、ObjectId、或包含 sample_id 等键的 dict。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("sample_id", "_id", "id", "_sample_id"):
+            if key in value:
+                v = value[key]
+                return str(v) if v is not None else None
+        return None
+    if value is not None:
+        return str(value)
+    return None
+
+
 def get_job_details(ds: fo.Dataset, anno_key: str) -> list[dict]:
     """查询某个标注运行下所有 CVAT Job 的详细状态。
 
@@ -623,12 +650,15 @@ def get_job_details(ds: fo.Dataset, anno_key: str) -> list[dict]:
             stop = job.get("stop_frame", 0)
 
             sample_ids: list[str] = []
-            for fid, sid in task_frames.items():
+            for fid, sid_raw in task_frames.items():
                 fid_int = int(fid) if isinstance(fid, str) else fid
                 if start <= fid_int <= stop:
-                    sample_ids.append(sid)
+                    sid = _extract_sample_id(sid_raw)
+                    if sid:
+                        sample_ids.append(sid)
 
             all_jobs.append({
+                "_anno_key": anno_key,
                 "job_id": job["id"],
                 "task_id": tid,
                 "state": job.get("state", "unknown"),
@@ -645,18 +675,40 @@ def get_job_details(ds: fo.Dataset, anno_key: str) -> list[dict]:
 
 def tag_samples_by_job_status(
     ds: fo.Dataset,
-    anno_key: str,
+    anno_keys: str | list[str],
     tag_prefix: str = "job",
 ) -> dict[str, int]:
     """根据 CVAT Job 状态为 FiftyOne 样本打标签。
 
-    为每个样本添加 ``{prefix}_{state}`` 和 ``{prefix}_{stage}`` 标签，
-    例如 ``job_completed``、``job_acceptance``。
-    """
-    jobs = get_job_details(ds, anno_key)
-    tagged: dict[str, int] = {}
+    每次调用会 **先清除** 所有相关样本上已有的 ``{prefix}_*`` 旧标签，
+    再按最新 Job 状态重新打标，因此可安全反复调用以同步最新状态。
 
-    for job in jobs:
+    支持传入单个或多个 anno_key，覆盖多字段推送的全部 Task。
+    """
+    if isinstance(anno_keys, str):
+        anno_keys = [anno_keys]
+
+    all_jobs: list[dict] = []
+    for key in anno_keys:
+        all_jobs.extend(get_job_details(ds, key))
+
+    all_sids: list[str] = []
+    for job in all_jobs:
+        all_sids.extend(job["sample_ids"])
+
+    if not all_sids:
+        return {}
+
+    # 清除旧的 job 状态标签
+    all_view = ds.select(all_sids)
+    existing_tags = all_view.distinct("tags")
+    for old_tag in existing_tags:
+        if old_tag.startswith(f"{tag_prefix}_"):
+            all_view.untag_samples(old_tag)
+
+    # 按最新 Job 状态打标签
+    tagged: dict[str, int] = {}
+    for job in all_jobs:
         sids = job["sample_ids"]
         if not sids:
             continue
@@ -671,21 +723,32 @@ def tag_samples_by_job_status(
 
 def get_samples_by_job_status(
     ds: fo.Dataset,
-    anno_key: str,
+    anno_keys: str | list[str],
     states: Optional[list[str]] = None,
     stages: Optional[list[str]] = None,
 ) -> fo.DatasetView:
     """获取特定 Job 状态/阶段下的样本视图。
 
+    支持传入单个或多个 anno_key。
     *states* 与 *stages* 为 AND 关系，``None`` 表示不过滤该维度。
     """
-    jobs = get_job_details(ds, anno_key)
+    if isinstance(anno_keys, str):
+        anno_keys = [anno_keys]
+
+    all_jobs: list[dict] = []
+    for key in anno_keys:
+        all_jobs.extend(get_job_details(ds, key))
+
     matching_ids: list[str] = []
-    for job in jobs:
+    seen: set[str] = set()
+    for job in all_jobs:
         state_ok = states is None or job["state"] in states
         stage_ok = stages is None or job["stage"] in stages
         if state_ok and stage_ok:
-            matching_ids.extend(job["sample_ids"])
+            for sid in job["sample_ids"]:
+                if sid not in seen:
+                    matching_ids.append(sid)
+                    seen.add(sid)
     if not matching_ids:
         return ds.limit(0)
     return ds.select(matching_ids)

@@ -21,7 +21,7 @@ custom_transforms = [
 ]
 
 results = model.train(
-    data="/home/cotek/datasets/temp/pose/data.yaml",
+    data="/home/cotek/datasets/temp/data.yaml",
     epochs=150,
     imgsz=640,
     # --- 色彩空间增强 ---

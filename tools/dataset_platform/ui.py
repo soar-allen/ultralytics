@@ -1505,10 +1505,18 @@ def _render_cvat_pull(ds):
         if not anno_key:
             st.error("请选择标注运行")
             return
-        with st.spinner("拉取中..."):
+        with st.spinner("拉取中（完成后会自动标记 Job 状态标签）..."):
             try:
                 result = cvat_sync.pull_from_cvat(ds, anno_key, cleanup=cleanup)
                 st.success("✅ 拉取成功，标注已同步到数据集")
+
+                job_tags = result.get("job_tags", {})
+                if job_tags:
+                    st.markdown("**自动标记的 Job 状态标签：**")
+                    for tag, count in job_tags.items():
+                        st.text(f"  {tag}: {count} 个样本")
+                    st.caption("标签已自动更新（旧标签已清除）。可在「数据导出」中按标签筛选导出。")
+
                 st.json(result)
             except Exception as e:
                 st.error(f"拉取失败: {e}")
@@ -1564,71 +1572,90 @@ def _render_cvat_review(ds):
         "- **Stage（工作阶段）**: annotation → validation → acceptance"
     )
 
-    selected_key = st.selectbox("选择标注运行", runs, key="review_anno_key")
+    selected_keys = st.multiselect(
+        "选择标注运行（可多选以覆盖多字段推送的所有 Task）",
+        runs, default=runs, key="review_anno_keys",
+        help="多字段推送时每个字段有独立的 anno_key，全选可一次查看所有 Task 的 Job 状态",
+    )
 
     if st.button("🔍 查询 Job 状态", key="btn_query_jobs"):
-        with st.spinner("正在查询 CVAT Job 状态..."):
-            try:
-                jobs = cvat_sync.get_job_details(ds, selected_key)
-                if jobs:
-                    import pandas as pd
-                    df = pd.DataFrame([{
-                        "Job ID": j["job_id"],
-                        "Task ID": j["task_id"],
-                        "状态 (state)": j["state"],
-                        "阶段 (stage)": j["stage"],
-                        "标注员": j["assignee"],
-                        "帧范围": f"{j['start_frame']}–{j['stop_frame']}",
-                        "样本数": j["num_samples"],
-                    } for j in jobs])
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+        if not selected_keys:
+            st.warning("请至少选择一个标注运行")
+        else:
+            with st.spinner("正在查询 CVAT Job 状态..."):
+                try:
+                    all_jobs: list[dict] = []
+                    for key in selected_keys:
+                        all_jobs.extend(cvat_sync.get_job_details(ds, key))
+                    if all_jobs:
+                        import pandas as pd
+                        df = pd.DataFrame([{
+                            "anno_key": j.get("_anno_key", ""),
+                            "Job ID": j["job_id"],
+                            "Task ID": j["task_id"],
+                            "状态 (state)": j["state"],
+                            "阶段 (stage)": j["stage"],
+                            "标注员": j["assignee"],
+                            "帧范围": f"{j['start_frame']}–{j['stop_frame']}",
+                            "样本数": j["num_samples"],
+                            "已映射样本": len(j["sample_ids"]),
+                        } for j in all_jobs])
+                        st.dataframe(df, use_container_width=True, hide_index=True)
 
-                    state_counts: dict[str, int] = {}
-                    stage_counts: dict[str, int] = {}
-                    for j in jobs:
-                        state_counts[j["state"]] = state_counts.get(j["state"], 0) + 1
-                        stage_counts[j["stage"]] = stage_counts.get(j["stage"], 0) + 1
+                        unmapped = [j for j in all_jobs if not j["sample_ids"]]
+                        if unmapped:
+                            st.warning(
+                                f"⚠️ 有 **{len(unmapped)}** 个 Job 未映射到 FiftyOne 样本 "
+                                f"（已映射样本=0），标记/筛选功能对这些 Job 不生效。"
+                                "这通常是因为 FiftyOne 未存储 frame_id_map。"
+                            )
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**按 State 统计：**")
-                        for s, c in state_counts.items():
-                            st.text(f"  {s}: {c} 个 Job")
-                    with col2:
-                        st.markdown("**按 Stage 统计：**")
-                        for s, c in stage_counts.items():
-                            st.text(f"  {s}: {c} 个 Job")
+                        state_counts: dict[str, int] = {}
+                        stage_counts: dict[str, int] = {}
+                        for j in all_jobs:
+                            state_counts[j["state"]] = state_counts.get(j["state"], 0) + 1
+                            stage_counts[j["stage"]] = stage_counts.get(j["stage"], 0) + 1
 
-                    st.session_state["_review_jobs"] = jobs
-                else:
-                    st.warning("未找到任何 Job")
-            except Exception as e:
-                st.error(f"查询失败: {e}")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("**按 State 统计：**")
+                            for s, c in state_counts.items():
+                                st.text(f"  {s}: {c} 个 Job")
+                        with col2:
+                            st.markdown("**按 Stage 统计：**")
+                            for s, c in stage_counts.items():
+                                st.text(f"  {s}: {c} 个 Job")
+
+                        st.session_state["_review_jobs"] = all_jobs
+                    else:
+                        st.warning("未找到任何 Job")
+                except Exception as e:
+                    st.error(f"查询失败: {e}")
 
     st.markdown("---")
 
-    # ==== 按 Job 状态标记样本 ====
-    st.markdown("### 🏷️ 按 Job 状态标记样本")
+    # ==== 刷新 Job 状态标签 ====
+    st.markdown("### 🏷️ 刷新 Job 状态标签")
     st.caption(
-        "将 CVAT Job 的 state 和 stage 信息作为标签写入 FiftyOne 样本。"
-        "标记后可在「数据导出」中按标签筛选，仅导出已完成/已验收的数据。"
+        "从 CVAT 拉取标注时会**自动**标记 Job 状态标签。"
+        "如果只是在 CVAT 端修改了 Job 状态（如审核通过）但不需要重新拉取标注数据，可以点击下方按钮仅刷新标签。"
     )
 
-    tag_prefix = st.text_input("标签前缀", value="job", key="review_tag_prefix",
-                               help="标签格式为 `{前缀}_{state}` 和 `{前缀}_{stage}`，如 job_completed、job_acceptance")
-
-    if st.button("🏷️ 标记样本", key="btn_tag_by_status"):
-        with st.spinner("正在标记..."):
-            try:
-                tagged = cvat_sync.tag_samples_by_job_status(ds, selected_key, tag_prefix=tag_prefix)
-                if tagged:
-                    st.success("✅ 标记完成")
-                    for tag, count in tagged.items():
-                        st.text(f"  {tag}: {count} 个样本")
-                else:
-                    st.warning("无法标记：可能缺少 frame_id_map 映射信息（FiftyOne 版本需支持此属性）")
-            except Exception as e:
-                st.error(f"标记失败: {e}")
+    if st.button("🔄 刷新状态标签（不拉取标注）", key="btn_refresh_tags"):
+        if not selected_keys:
+            st.warning("请先在上方选择标注运行")
+        else:
+            with st.spinner("正在从 CVAT 查询最新 Job 状态并更新标签..."):
+                try:
+                    tagged = cvat_sync.tag_samples_by_job_status(ds, selected_keys)
+                    if tagged:
+                        st.success("✅ 标签已更新为最新状态")
+                        for tag, count in tagged.items():
+                            st.text(f"  {tag}: {count} 个样本")
+                    else:
+                        st.warning("无法标记：可能缺少 frame_id_map 映射信息")
+                except Exception as e:
+                    st.error(f"刷新失败: {e}")
 
     st.markdown("---")
 
@@ -1652,24 +1679,27 @@ def _render_cvat_review(ds):
         )
 
     if st.button("🔎 筛选并在 FiftyOne 中查看", key="btn_filter_jobs"):
-        with st.spinner("正在筛选..."):
-            try:
-                view = cvat_sync.get_samples_by_job_status(
-                    ds, selected_key,
-                    states=filter_states or None,
-                    stages=filter_stages or None,
-                )
-                count = len(view)
-                st.info(f"符合条件的样本: **{count}** 个")
-                if count > 0:
-                    session = dm.get_session()
-                    if session:
-                        dm.set_session_view(view)
-                        st.success("✅ 已在 FiftyOne App 中展示筛选结果")
-                    else:
-                        st.warning("请先启动 FiftyOne App（在侧边栏点击「启动 FiftyOne App」）")
-            except Exception as e:
-                st.error(f"筛选失败: {e}")
+        if not selected_keys:
+            st.warning("请先在上方选择标注运行")
+        else:
+            with st.spinner("正在筛选..."):
+                try:
+                    view = cvat_sync.get_samples_by_job_status(
+                        ds, selected_keys,
+                        states=filter_states or None,
+                        stages=filter_stages or None,
+                    )
+                    count = len(view)
+                    st.info(f"符合条件的样本: **{count}** 个")
+                    if count > 0:
+                        session = dm.get_session()
+                        if session:
+                            dm.set_session_view(view)
+                            st.success("✅ 已在 FiftyOne App 中展示筛选结果")
+                        else:
+                            st.warning("请先启动 FiftyOne App（在侧边栏点击「启动 FiftyOne App」）")
+                except Exception as e:
+                    st.error(f"筛选失败: {e}")
 
     st.markdown("---")
 
@@ -1829,6 +1859,15 @@ def _render_export():
     label_field = st.selectbox("标签字段", info.get("label_fields", ["ground_truth"]),
                                key="export_label_field")
 
+    all_tags = sorted(ds.distinct("tags"))
+    if all_tags:
+        selected_tags = st.multiselect(
+            "按 Tag 筛选样本（留空导出全部）", all_tags, key="export_tags",
+            help="仅导出包含所选任一 Tag 的样本。Tag 来源包括 CVAT Job 状态标记、手动标签等",
+        )
+    else:
+        selected_tags = []
+
     all_classes = dm.get_label_classes(ds, label_field)
     if all_classes:
         selected_classes = st.multiselect(
@@ -1866,6 +1905,12 @@ def _render_export():
     if isinstance(splits, dict) and total_pct != 100:
         can_export = False
 
+    if selected_tags:
+        export_view = ds.match_tags(selected_tags)
+        st.info(f"已按 Tag 筛选：{', '.join(selected_tags)}，共 {len(export_view)} 个样本")
+    else:
+        export_view = ds
+
     if st.button("📦 开始导出", key="btn_export", disabled=not can_export):
         if not output_dir:
             st.error("请指定输出目录")
@@ -1876,24 +1921,24 @@ def _render_export():
             try:
                 if format_choice == "YOLO Detect (纯框)":
                     result = exporter.export_yolo_detect(
-                        ds, output_dir, label_field=label_field,
+                        export_view, output_dir, label_field=label_field,
                         classes=classes, splits=splits,
                     )
                 elif format_choice == "YOLO Pose (关键点)":
                     result = exporter.export_yolo_pose(
-                        ds, output_dir, det_field=label_field,
+                        export_view, output_dir, det_field=label_field,
                         kp_field=kp_field, classes=classes, splits=splits,
                     )
                 elif format_choice == "YOLO Pose (四边形转关键点)":
                     result = exporter.export_yolo_pose_from_polylines(
-                        ds, output_dir, label_field=label_field,
+                        export_view, output_dir, label_field=label_field,
                         classes=classes, splits=splits,
                         edge_threshold=edge_threshold,
                         bbox_margin=bbox_margin,
                     )
                 elif format_choice == "YOLO OBB (旋转框)":
                     result = exporter.export_yolo_obb(
-                        ds, output_dir, label_field=label_field,
+                        export_view, output_dir, label_field=label_field,
                         obb_field=obb_field if obb_field else None,
                         classes=classes, splits=splits,
                     )
