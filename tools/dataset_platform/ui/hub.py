@@ -94,8 +94,16 @@ def _render_hub_statistics(ds, info: dict):
 
     available_tags = info["tags"]
     if available_tags:
-        tag_counts = ds.count_values("tags")
-        tag_counts.pop(None, None)
+        raw_counts = ds.count_values("tags")
+        raw_counts.pop(None, None)
+        num_samples = info["num_samples"]
+
+        has_anomaly = any(v > num_samples for v in raw_counts.values())
+        if has_anomaly:
+            tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
+        else:
+            tag_counts = raw_counts
+
         if tag_counts:
             df_tags = pd.DataFrame(
                 list(tag_counts.items()), columns=["标签", "样本数"]
@@ -110,6 +118,11 @@ def _render_hub_statistics(ds, info: dict):
                     f"共 **{len(tag_counts)}** 种标签，"
                     f"一个样本可拥有多个标签"
                 )
+            if has_anomaly:
+                st.warning(
+                    "⚠️ 检测到数据库中存在**重复 Tags**（同一样本内相同标签出现多次），"
+                    "请点击下方『修复重复 Tags』清理。上方统计已自动修正显示。"
+                )
     else:
         st.info("当前数据集没有任何样本 Tags")
 
@@ -120,10 +133,11 @@ def _render_hub_statistics(ds, info: dict):
         if st.button("🔍 扫描并修复", key="btn_fix_dup_tags"):
             fixed = 0
             with st.spinner("扫描样本 Tags..."):
-                for sample in ds.select_fields("tags").iter_samples(autosave=True):
+                for sample in ds.iter_samples(progress=True):
                     unique = list(dict.fromkeys(sample.tags))
                     if len(unique) != len(sample.tags):
                         sample.tags = unique
+                        sample.save()
                         fixed += 1
             if fixed:
                 st.success(f"已修复 {fixed} 个样本的重复 Tags")

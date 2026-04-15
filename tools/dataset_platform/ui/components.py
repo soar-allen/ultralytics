@@ -112,17 +112,22 @@ def _open_native_dialog(
 ) -> str | None:
     """
     打开系统原生文件对话框。
-    优先级: tkinter (跨平台) → zenity (Linux GTK) → None
+    Linux: zenity (原生 GTK) → tkinter
+    Windows/macOS: tkinter → zenity
     """
-    # --- 1) tkinter: Windows / macOS / Linux 均可用 ---
+    if sys.platform == "linux":
+        if shutil.which("zenity"):
+            result = _zenity_dialog(mode, title, start_dir, file_extensions)
+            if result is not None:
+                return result
+        return _tkinter_dialog(mode, title, start_dir, file_extensions)
+
+    # Windows / macOS: tkinter 优先
     result = _tkinter_dialog(mode, title, start_dir, file_extensions)
     if result is not None:
         return result
-
-    # --- 2) zenity: Linux GTK 桌面环境 ---
-    if sys.platform != "win32" and shutil.which("zenity"):
+    if shutil.which("zenity"):
         return _zenity_dialog(mode, title, start_dir, file_extensions)
-
     return None
 
 
