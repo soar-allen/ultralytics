@@ -87,7 +87,8 @@ def _render_hard_mining(ds):
             try:
                 if tag_hard:
                     for sample in hard_view.iter_samples(autosave=True):
-                        sample.tags.append("hard_sample")
+                        if "hard_sample" not in sample.tags:
+                            sample.tags.append("hard_sample")
                     st.info(f"已为 {len(hard_view)} 个难例添加 `hard_sample` 标签")
 
                 with st.spinner("推送难例到 CVAT..."):
@@ -147,18 +148,16 @@ def _render_brain(ds):
                         dm.set_session_view(view)
                         st.success(f"✅ 已展示 uniqueness 最高的 {n_unique} 个样本")
 
-            stats = ds.aggregate([
-                {"$group": {"_id": None,
-                            "mean": {"$avg": "$uniqueness"},
-                            "min": {"$min": "$uniqueness"},
-                            "max": {"$max": "$uniqueness"}}}
-            ])
-            if stats:
-                s = stats[0]
+            import fiftyone as fo_agg
+            try:
+                mean_val = ds.mean("uniqueness")
+                bounds = ds.bounds("uniqueness")
                 mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("平均值", f"{s.get('mean', 0):.3f}")
-                mc2.metric("最小值", f"{s.get('min', 0):.3f}")
-                mc3.metric("最大值", f"{s.get('max', 0):.3f}")
+                mc1.metric("平均值", f"{mean_val:.3f}" if mean_val is not None else "N/A")
+                mc2.metric("最小值", f"{bounds[0]:.3f}" if bounds and bounds[0] is not None else "N/A")
+                mc3.metric("最大值", f"{bounds[1]:.3f}" if bounds and bounds[1] is not None else "N/A")
+            except Exception:
+                pass
 
     with tab_hardness:
         st.markdown("""

@@ -94,20 +94,90 @@ def _render_hub_statistics(ds, info: dict):
 
     available_tags = ds.distinct("tags")
     if available_tags:
-        tag_counts = ds.count_values("tags")
+        tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
         if tag_counts:
             df_tags = pd.DataFrame(
                 list(tag_counts.items()), columns=["标签", "样本数"]
             ).sort_values("样本数", ascending=False)
+
+            has_dup = any(
+                len(s.tags) != len(set(s.tags))
+                for s in ds.select_fields("tags").iter_samples()
+            )
 
             chart_col, table_col = st.columns([2, 1])
             with chart_col:
                 st.bar_chart(df_tags.set_index("标签"))
             with table_col:
                 st.dataframe(df_tags, use_container_width=True, hide_index=True)
-                st.caption(f"共 **{len(tag_counts)}** 种标签")
+                st.caption(
+                    f"共 **{len(tag_counts)}** 种标签，"
+                    f"一个样本可拥有多个标签"
+                )
+            if has_dup:
+                st.warning(
+                    "⚠️ 检测到部分样本存在**重复 Tags**（同一标签出现多次），"
+                    "这可能由重复运行质量检查等操作导致。请使用下方的『修复重复Tags』功能清理。"
+                )
     else:
         st.info("当前数据集没有任何样本 Tags")
+
+    # --- 修复重复 Tags ---
+    st.markdown("---")
+    with st.expander("🔧 修复重复 Tags"):
+        st.caption("扫描所有样本，将 tags 列表中的重复项去重（如 `['a','a','b']` → `['a','b']`）。")
+        if st.button("🔍 扫描并修复", key="btn_fix_dup_tags"):
+            fixed = 0
+            with st.spinner("扫描样本 Tags..."):
+                for sample in ds.select_fields("tags").iter_samples(autosave=True):
+                    unique = list(dict.fromkeys(sample.tags))
+                    if len(unique) != len(sample.tags):
+                        sample.tags = unique
+                        fixed += 1
+            if fixed:
+                st.success(f"已修复 {fixed} 个样本的重复 Tags")
+                st.rerun()
+            else:
+                st.success("所有样本的 Tags 均无重复，无需修复")
+
+    # --- 数据完整性检查 ---
+    st.markdown("---")
+    with st.expander("🔍 数据集完整性检查"):
+        if st.button("运行检查", key="btn_integrity_check"):
+            with st.spinner("检查文件完整性..."):
+                import os as _os
+                total = info["num_samples"]
+                missing = []
+                for fp in ds.values("filepath"):
+                    if not _os.path.isfile(fp):
+                        missing.append(fp)
+                ok_count = total - len(missing)
+
+            col_ok, col_miss = st.columns(2)
+            col_ok.metric("文件存在", f"{ok_count}/{total}")
+            col_miss.metric("文件缺失", len(missing))
+
+            if missing:
+                st.warning(
+                    f"有 {len(missing)} 个样本指向不存在的文件。"
+                    "这些样本的记录仍在 FiftyOne 中，但图片文件已丢失。"
+                )
+                with st.expander(f"查看缺失文件列表 ({len(missing)})"):
+                    for fp in missing[:100]:
+                        st.text(fp)
+                    if len(missing) > 100:
+                        st.caption(f"...及其他 {len(missing) - 100} 个")
+
+                if st.checkbox("确认从数据集中移除这些缺失样本", key="confirm_remove_missing"):
+                    if st.button("🗑️ 移除缺失样本", key="btn_remove_missing"):
+                        view = ds.match(
+                            __import__("fiftyone").ViewField("filepath").is_in(missing)
+                        )
+                        ds.delete_samples(view)
+                        st.session_state["_toast_msg"] = f"已移除 {len(missing)} 个缺失样本"
+                        st.rerun()
+            else:
+                st.success("所有样本的图片文件均存在，数据集完整")
 
     # --- 数据集元信息 ---
     with st.expander("📋 数据集完整元信息", expanded=False):
@@ -307,53 +377,144 @@ def _render_label_management(ds):
                 ).sort_values("样本数", ascending=False)
                 st.dataframe(df, use_container_width=True)
 
-    # ---- 标注类别重命名 ----
+    # ---- 标注类别操作 ----
     st.markdown("---")
-    st.subheader("标注类别重命名")
-    st.caption("可将指定标签字段中的某个类别批量重命名为新名称")
-
     info = dm.get_dataset_info(ds)
     label_fields = info.get("label_fields", [])
     if not label_fields:
         st.info("当前数据集没有标签字段，请先导入标注数据")
         return
 
-    rename_field = st.selectbox("选择标签字段", label_fields, key="rename_field")
-    current_classes = dm.get_label_classes(ds, rename_field)
+    op_tab_rename, op_tab_del_label, op_tab_del_field = st.tabs([
+        "✏️ 类别重命名", "🗑️ 批量删除标注", "⚠️ 删除字段",
+    ])
 
-    if not current_classes:
-        st.info(f"字段 `{rename_field}` 中暂无标签类别")
-        return
+    # ── 类别重命名 ──
+    with op_tab_rename:
+        st.subheader("标注类别重命名")
+        st.caption("将指定字段中的某个类别批量重命名为新名称")
 
-    st.markdown(f"**当前类别** ({len(current_classes)}): `{'`, `'.join(current_classes)}`")
+        rename_field = st.selectbox("选择标签字段", label_fields, key="rename_field")
+        current_classes = dm.get_label_classes(ds, rename_field)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        old_label = st.selectbox("选择要重命名的类别", current_classes, key="rename_old")
-    with col2:
-        new_label = st.text_input("新类别名称", key="rename_new")
+        if current_classes:
+            st.markdown(f"**当前类别** ({len(current_classes)}): `{'`, `'.join(current_classes)}`")
+            col1, col2 = st.columns(2)
+            with col1:
+                old_label = st.selectbox("选择要重命名的类别", current_classes, key="rename_old")
+            with col2:
+                new_label = st.text_input("新类别名称", key="rename_new")
 
-    if st.button("✏️ 执行重命名", key="btn_rename_label"):
-        if not new_label or not new_label.strip():
-            st.error("请输入新类别名称")
-        elif new_label.strip() == old_label:
-            st.warning("新名称与旧名称相同，无需操作")
+            if st.button("✏️ 执行重命名", key="btn_rename_label"):
+                if not new_label or not new_label.strip():
+                    st.error("请输入新类别名称")
+                elif new_label.strip() == old_label:
+                    st.warning("新名称与旧名称相同")
+                else:
+                    with st.spinner(f"正在将 `{old_label}` 重命名为 `{new_label.strip()}`..."):
+                        try:
+                            count = dm.rename_label(ds, rename_field, old_label, new_label.strip())
+                            st.session_state["_toast_msg"] = f"已将 '{old_label}' 重命名为 '{new_label.strip()}'（共 {count} 个实例）"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"重命名失败: {e}")
         else:
-            with st.spinner(f"正在将 `{old_label}` 重命名为 `{new_label.strip()}`..."):
-                try:
-                    count = dm.rename_label(ds, rename_field, old_label, new_label.strip())
-                    st.session_state["_toast_msg"] = f"已将 '{old_label}' 重命名为 '{new_label.strip()}'（共 {count} 个实例）"
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"重命名失败: {e}")
+            st.info(f"字段 `{rename_field}` 中暂无标签类别")
 
+    # ── 批量删除标注 ──
+    with op_tab_del_label:
+        st.subheader("批量删除指定类别的标注")
+        st.caption("从指定字段中删除选中类别的所有标注实例（不删除样本本身）")
+
+        del_field = st.selectbox("选择标签字段", label_fields, key="del_label_field")
+        del_classes = dm.get_label_classes(ds, del_field)
+
+        if del_classes:
+            import pandas as pd
+            stats_del = dm.get_label_stats(ds, del_field)
+            if stats_del:
+                df_stats = pd.DataFrame(
+                    list(stats_del.items()), columns=["类别", "数量"]
+                ).sort_values("数量", ascending=False)
+                st.dataframe(df_stats, use_container_width=True, hide_index=True)
+
+            selected_classes = st.multiselect(
+                "选择要删除的类别（可多选）", del_classes, key="del_label_classes",
+            )
+
+            if selected_classes:
+                total_to_delete = sum(stats_del.get(c, 0) for c in selected_classes)
+                st.warning(f"将从字段 `{del_field}` 中删除 **{len(selected_classes)}** 个类别共 **{total_to_delete}** 个标注实例")
+
+                confirm_del = st.checkbox(
+                    f"确认删除以上 {total_to_delete} 个标注实例（不可撤销）",
+                    key="confirm_del_labels",
+                )
+                if st.button("🗑️ 执行批量删除", key="btn_del_labels", disabled=not confirm_del):
+                    with st.spinner("正在删除标注..."):
+                        try:
+                            count = dm.delete_labels_by_class(ds, del_field, selected_classes)
+                            st.session_state["_toast_msg"] = f"已从字段 '{del_field}' 中删除 {count} 个标注实例"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"删除失败: {e}")
+        else:
+            st.info(f"字段 `{del_field}` 中暂无标签类别")
+
+    # ── 删除字段 ──
+    with op_tab_del_field:
+        st.subheader("删除整个标签字段")
+        st.caption("从数据集中永久删除一个标签字段及其所有标注数据")
+
+        schema = ds.get_field_schema()
+        deletable_fields = []
+        for fn, field in schema.items():
+            if fn.startswith("_") or fn in ("id", "filepath", "tags", "metadata"):
+                continue
+            deletable_fields.append(fn)
+
+        if deletable_fields:
+            field_to_del = st.selectbox(
+                "选择要删除的字段", deletable_fields, key="del_field_select",
+            )
+
+            field_type = dm.get_field_label_type(ds, field_to_del)
+            if field_type:
+                field_stats = dm.get_label_stats(ds, field_to_del)
+                total_instances = sum(field_stats.values()) if field_stats else 0
+                st.info(f"字段类型: **{field_type}**，包含 **{len(field_stats)}** 个类别共 **{total_instances}** 个标注实例")
+            else:
+                st.info(f"字段 `{field_to_del}` 是非标签类型字段")
+
+            st.error("此操作不可撤销！删除后该字段的所有数据将永久丢失。")
+            confirm_text = st.text_input(
+                f"输入字段名 `{field_to_del}` 以确认删除",
+                key="confirm_del_field_text",
+            )
+            if st.button(
+                f"⚠️ 永久删除字段 {field_to_del}",
+                key="btn_del_field",
+                disabled=(confirm_text != field_to_del),
+            ):
+                with st.spinner(f"正在删除字段 `{field_to_del}`..."):
+                    try:
+                        dm.delete_sample_field(ds, field_to_del)
+                        st.session_state["_toast_msg"] = f"已删除字段 '{field_to_del}'"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"删除失败: {e}")
+        else:
+            st.info("当前数据集没有可删除的字段")
+
+    # ── 标注统计 ──
     st.markdown("---")
     st.subheader("标注统计")
-    stats = dm.get_label_stats(ds, rename_field)
+    stat_field = st.selectbox("查看字段", label_fields, key="stat_field_view")
+    stats = dm.get_label_stats(ds, stat_field)
     if stats:
         import pandas as pd
         df = pd.DataFrame(
             list(stats.items()), columns=["类别", "数量"]
         ).sort_values("数量", ascending=False)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 

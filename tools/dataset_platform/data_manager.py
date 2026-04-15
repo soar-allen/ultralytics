@@ -326,6 +326,47 @@ def rename_label(
     return count
 
 
+def delete_labels_by_class(
+    ds: fo.Dataset,
+    field_name: str,
+    class_names: list[str],
+    view: fo.DatasetView | None = None,
+) -> int:
+    """批量删除指定字段中特定类别的所有标注实例，返回删除数。"""
+    from fiftyone import ViewField as F
+
+    path = _resolve_label_path(ds, field_name)
+    if path is None:
+        raise ValueError(f"字段 '{field_name}' 不是标签类型字段")
+
+    sub_path = path.rsplit(".label", 1)[0]
+    items_attr = sub_path.split(".")[-1]
+
+    target = view if view is not None else ds
+    class_set = set(class_names)
+    count = 0
+    for sample in target.iter_samples(autosave=True):
+        container = sample[field_name]
+        if container is None:
+            continue
+        items = getattr(container, items_attr, [])
+        before = len(items)
+        kept = [it for it in items if it.label not in class_set]
+        removed = before - len(kept)
+        if removed > 0:
+            setattr(container, items_attr, kept)
+            count += removed
+
+    logger.info("批量删除标签: 字段=%s, 类别=%s, 删除=%d", field_name, class_names, count)
+    return count
+
+
+def delete_sample_field(ds: fo.Dataset, field_name: str):
+    """删除数据集中的指定样本字段。"""
+    ds.delete_sample_field(field_name)
+    logger.info("已删除字段: %s", field_name)
+
+
 # ---------------------------------------------------------------------------
 # Label field merge
 # ---------------------------------------------------------------------------

@@ -127,17 +127,20 @@ def find_corrupt_or_abnormal(
             img = cv2.imread(fp)
             if img is None:
                 bad_ids.append(sample.id)
-                sample.tags.append("corrupt")
+                if "corrupt" not in sample.tags:
+                    sample.tags.append("corrupt")
                 sample.save()
                 continue
             h, w = img.shape[:2]
             if w < min_size or h < min_size or w > max_size or h > max_size:
                 bad_ids.append(sample.id)
-                sample.tags.append("abnormal_size")
+                if "abnormal_size" not in sample.tags:
+                    sample.tags.append("abnormal_size")
                 sample.save()
         except Exception:
             bad_ids.append(sample.id)
-            sample.tags.append("corrupt")
+            if "corrupt" not in sample.tags:
+                sample.tags.append("corrupt")
             sample.save()
 
     logger.info("检测到 %d 个损坏/异常样本", len(bad_ids))
@@ -547,3 +550,756 @@ def auto_predict_yolo(
 
     logger.info("YOLO 预标注完成 (%s): %s", task, dict(stats))
     return dict(stats)
+
+
+# ===================================================================
+# Polyline NMS 去重工具
+# ===================================================================
+
+def _polyline_pts_to_contour(pts: list[tuple[float, float]], scale: int = 1000) -> np.ndarray:
+    """将归一化 polyline 点列表转为 cv2 contour (整数像素坐标)。"""
+    return np.array(
+        [[int(x * scale), int(y * scale)] for x, y in pts], dtype=np.int32,
+    )
+
+
+def _polygon_iou(pts_a: list[tuple[float, float]], pts_b: list[tuple[float, float]],
+                 scale: int = 1000) -> float:
+    """计算两个多边形的 IoU（基于栅格化）。"""
+    ca = _polyline_pts_to_contour(pts_a, scale)
+    cb = _polyline_pts_to_contour(pts_b, scale)
+
+    canvas_a = np.zeros((scale, scale), dtype=np.uint8)
+    canvas_b = np.zeros((scale, scale), dtype=np.uint8)
+    cv2.fillPoly(canvas_a, [ca], 1)
+    cv2.fillPoly(canvas_b, [cb], 1)
+
+    inter = int(np.sum(canvas_a & canvas_b))
+    union = int(np.sum(canvas_a | canvas_b))
+    return inter / union if union > 0 else 0.0
+
+
+def _merge_polylines_nms(
+    existing_polylines: list,
+    new_polylines: list,
+    iou_threshold: float = 0.5,
+) -> tuple[list, int]:
+    """
+    将新预测的 polyline 合并到已有列表中，跳过与已有同类别标注 IoU 超过阈值的重复项。
+
+    Returns:
+        (合并后的列表, 被抑制的数量)
+    """
+    merged = list(existing_polylines)
+    suppressed = 0
+
+    for new_pl in new_polylines:
+        new_pts = new_pl.points[0] if new_pl.points else []
+        if len(new_pts) < 3:
+            merged.append(new_pl)
+            continue
+
+        is_dup = False
+        for old_pl in merged:
+            if old_pl.label != new_pl.label:
+                continue
+            old_pts = old_pl.points[0] if old_pl.points else []
+            if len(old_pts) < 3:
+                continue
+            iou = _polygon_iou(new_pts, old_pts)
+            if iou >= iou_threshold:
+                is_dup = True
+                break
+
+        if is_dup:
+            suppressed += 1
+        else:
+            merged.append(new_pl)
+
+    return merged, suppressed
+
+
+# ===================================================================
+# YOLO Pose → 四角多边形 (Polyline) 预标注
+# ===================================================================
+
+def auto_predict_pose_to_polyline(
+    ds: fo.Dataset,
+    model_path: str,
+    pred_field: str = "predictions",
+    conf_threshold: float = 0.25,
+    filter_classes: Optional[list[str]] = None,
+    skip_labeled: bool = False,
+    nms_iou: float = 0.5,
+    view: Optional[fo.DatasetView] = None,
+) -> dict:
+    """
+    使用 YOLO Pose 模型检测四个关键点，将其连接成闭合四边形 Polyline。
+
+    关键点顺序应为 tl → tr → br → bl。
+    自动使用模型输出的类别名称（支持多类别）。
+
+    Args:
+        filter_classes: 仅保留这些类别的检测结果（None = 全部保留）
+        skip_labeled: 完全跳过已有标注的样本
+        nms_iou: 标注级 NMS 的 IoU 阈值
+    """
+    from ultralytics import YOLO
+
+    model = YOLO(model_path)
+    target = view if view is not None else ds
+    stats = defaultdict(int)
+
+    for sample in target.iter_samples(progress=True, autosave=True):
+        existing_polylines = []
+        if sample.has_field(pred_field):
+            existing_field = sample[pred_field]
+            if existing_field is not None and hasattr(existing_field, "polylines"):
+                existing_polylines = list(existing_field.polylines or [])
+
+        if skip_labeled and len(existing_polylines) > 0:
+            stats["skipped_labeled"] += 1
+            continue
+
+        results = model(sample.filepath, conf=conf_threshold, verbose=False)
+        if not results:
+            stats["images_processed"] += 1
+            continue
+
+        result = results[0]
+        h_img, w_img = result.orig_shape
+        new_polylines = []
+
+        if result.keypoints is not None and result.boxes is not None:
+            for i, box in enumerate(result.boxes):
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                det_label = model.names.get(cls_id, f"class_{cls_id}")
+
+                if filter_classes and det_label not in filter_classes:
+                    stats["filtered_class"] += 1
+                    continue
+
+                if i >= len(result.keypoints):
+                    break
+                kp_data = result.keypoints[i]
+                xy = kp_data.xy[0] if hasattr(kp_data, "xy") else kp_data.data[0, :, :2]
+
+                if xy.shape[0] < 4:
+                    stats["skipped_few_kp"] += 1
+                    continue
+
+                pts = []
+                for ki in range(4):
+                    px = float(xy[ki, 0]) / w_img
+                    py = float(xy[ki, 1]) / h_img
+                    px = max(0.0, min(1.0, px))
+                    py = max(0.0, min(1.0, py))
+                    pts.append((px, py))
+
+                new_polylines.append(fo.Polyline(
+                    label=det_label,
+                    points=[pts],
+                    closed=True,
+                    filled=True,
+                    confidence=conf,
+                ))
+                stats["detected"] += 1
+
+        if new_polylines:
+            merged, suppressed = _merge_polylines_nms(
+                existing_polylines, new_polylines, iou_threshold=nms_iou,
+            )
+            stats["suppressed_nms"] += suppressed
+            stats["added"] += len(new_polylines) - suppressed
+            sample[pred_field] = fo.Polylines(polylines=merged)
+
+        stats["images_processed"] += 1
+
+    logger.info("Pose→Polyline 预标注完成: %s", dict(stats))
+    return dict(stats)
+
+
+# ===================================================================
+# SAM3 Text Prompt → 四角多边形 (Polyline) 预标注
+# ===================================================================
+
+def _mask_to_quadrilateral(mask_np: np.ndarray) -> list[tuple[float, float]] | None:
+    """
+    从二值 mask 提取最小面积旋转矩形的四个顶点，按 tl→tr→br→bl 排序。
+
+    Returns:
+        归一化坐标 [(x,y), ...] 共 4 个点，或 None（mask 面积过小）。
+    """
+    contours, _ = cv2.findContours(
+        mask_np.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 10:
+        return None
+
+    rect = cv2.minAreaRect(largest)
+    box = cv2.boxPoints(rect)
+
+    h, w = mask_np.shape[:2]
+    pts = [(float(box[i, 0]) / w, float(box[i, 1]) / h) for i in range(4)]
+
+    # 排序为 tl, tr, br, bl（先按 y 分上下，再按 x 分左右）
+    pts.sort(key=lambda p: p[1])
+    top = sorted(pts[:2], key=lambda p: p[0])
+    bottom = sorted(pts[2:], key=lambda p: p[0])
+    ordered = [top[0], top[1], bottom[1], bottom[0]]
+
+    return [(max(0.0, min(1.0, x)), max(0.0, min(1.0, y))) for x, y in ordered]
+
+
+def _mask_to_bbox(mask_np: np.ndarray) -> list[float] | None:
+    """从二值 mask 提取轴对齐 bounding box，返回 [x, y, w, h] 归一化坐标。"""
+    contours, _ = cv2.findContours(
+        mask_np.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return None
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 10:
+        return None
+    x, y, w, h_box = cv2.boundingRect(largest)
+    h_img, w_img = mask_np.shape[:2]
+    return [x / w_img, y / h_img, w / w_img, h_box / h_img]
+
+
+def _polyline_to_xyxy(polyline, img_w: int, img_h: int) -> list[float]:
+    """从 Polyline 的归一化点计算像素级 xyxy bbox。"""
+    pts = polyline.points[0] if polyline.points else []
+    if not pts:
+        return [0, 0, 1, 1]
+    xs = [p[0] * img_w for p in pts]
+    ys = [p[1] * img_h for p in pts]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _bbox_iou_xyxy(a: list[float], b: list[float]) -> float:
+    """计算两个 xyxy bbox 的 IoU。"""
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _merge_detections_nms(
+    existing: list,
+    new_dets: list,
+    iou_threshold: float = 0.5,
+) -> tuple[list, int]:
+    """对 fo.Detection 列表进行同类别 NMS 合并。"""
+    merged = list(existing)
+    suppressed = 0
+    for det in new_dets:
+        bb_new = det.bounding_box
+        if not bb_new:
+            merged.append(det)
+            continue
+        new_xyxy = [bb_new[0], bb_new[1], bb_new[0] + bb_new[2], bb_new[1] + bb_new[3]]
+        is_dup = False
+        for old in merged:
+            if old.label != det.label:
+                continue
+            bb_old = old.bounding_box
+            if not bb_old:
+                continue
+            old_xyxy = [bb_old[0], bb_old[1], bb_old[0] + bb_old[2], bb_old[1] + bb_old[3]]
+            if _bbox_iou_xyxy(new_xyxy, old_xyxy) >= iou_threshold:
+                is_dup = True
+                break
+        if is_dup:
+            suppressed += 1
+        else:
+            merged.append(det)
+    return merged, suppressed
+
+
+def _select_best_mask(
+    masks: np.ndarray,
+    polygon_points_px: list[tuple[float, float]],
+    strategy: str = "smallest_covering",
+) -> int | None:
+    """从 SAM 返回的多个 mask 中选择最佳的一个。
+
+    策略:
+    - "largest": 面积最大的 mask
+    - "smallest_covering": 包含 polygon 区域且面积最小的 mask（推荐）
+    """
+    n = masks.shape[0]
+    if n == 0:
+        return None
+    if n == 1:
+        return 0
+
+    areas = masks.reshape(n, -1).sum(axis=1)
+
+    if strategy == "largest":
+        return int(np.argmax(areas))
+
+    if strategy == "smallest_covering":
+        h, w = masks.shape[1], masks.shape[2]
+        poly_mask = np.zeros((h, w), dtype=np.uint8)
+        pts_arr = np.array(polygon_points_px, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(poly_mask, [pts_arr], 1)
+        poly_area = float(poly_mask.sum())
+
+        if poly_area == 0:
+            return int(np.argmax(areas))
+
+        best_idx, best_area = -1, float("inf")
+        for i in range(n):
+            m = (masks[i] > 0.5).astype(np.uint8)
+            coverage = float((m & poly_mask).sum()) / poly_area
+            if coverage < 0.3:
+                continue
+            a = float(m.sum())
+            if a < best_area:
+                best_area = a
+                best_idx = i
+
+        if best_idx >= 0:
+            return best_idx
+        coverages = [
+            float(((masks[i] > 0.5).astype(np.uint8) & poly_mask).sum()) / poly_area
+            for i in range(n)
+        ]
+        return int(np.argmax(coverages))
+
+    return int(np.argmax(areas))
+
+
+def _mask_to_output_item(
+    mask_np: np.ndarray, label: str, conf: float, output_mode: str,
+) -> fo.Polyline | fo.Detection | None:
+    """将 mask 转为 Polyline 或 Detection，统一输出逻辑。"""
+    if output_mode == "polyline":
+        quad = _mask_to_quadrilateral(mask_np)
+        if quad is None:
+            return None
+        return fo.Polyline(
+            label=label, points=[quad], closed=True, filled=True, confidence=conf,
+        )
+    else:
+        bbox = _mask_to_bbox(mask_np)
+        if bbox is None:
+            return None
+        return fo.Detection(label=label, bounding_box=bbox, confidence=conf)
+
+
+def _save_items_with_nms(
+    sample, pred_field: str, existing_items: list, new_items: list,
+    output_mode: str, nms_iou: float, stats: dict,
+) -> bool:
+    """合并 NMS 并保存到样本，返回是否有输出。"""
+    if not new_items:
+        return False
+    if output_mode == "polyline":
+        merged, suppressed = _merge_polylines_nms(
+            existing_items, new_items, iou_threshold=nms_iou,
+        )
+        sample[pred_field] = fo.Polylines(polylines=merged)
+    else:
+        merged, suppressed = _merge_detections_nms(
+            existing_items, new_items, iou_threshold=nms_iou,
+        )
+        sample[pred_field] = fo.Detections(detections=merged)
+    stats["suppressed_nms"] += suppressed
+    stats["added"] += len(new_items) - suppressed
+    return True
+
+
+def _read_existing_items(sample, pred_field: str, output_mode: str) -> list:
+    """安全读取样本已有标注列表。"""
+    if not sample.has_field(pred_field):
+        return []
+    existing_field = sample[pred_field]
+    if existing_field is None:
+        return []
+    if output_mode == "polyline" and hasattr(existing_field, "polylines"):
+        return list(existing_field.polylines or [])
+    if output_mode != "polyline" and hasattr(existing_field, "detections"):
+        return list(existing_field.detections or [])
+    return []
+
+
+def _tag_fail(sample, fail_tag: str, stats: dict):
+    """给样本打失败标签。"""
+    if fail_tag and fail_tag not in sample.tags:
+        sample.tags.append(fail_tag)
+        stats["fail_tagged"] += 1
+
+
+def auto_predict_sam3(
+    ds: fo.Dataset,
+    model_path: str,
+    pred_field: str = "predictions",
+    conf_threshold: float = 0.25,
+    output_mode: str = "polyline",
+    prompt_mode: str = "text",
+    text_prompts: Optional[list[str]] = None,
+    box_source_field: Optional[str] = None,
+    box_source_label: Optional[str] = None,
+    box_expand_ratio: float = 0.5,
+    box_mask_strategy: str = "smallest_covering",
+    label_name: str = "object",
+    skip_labeled: bool = False,
+    nms_iou: float = 0.5,
+    fail_tag: str = "",
+    view: Optional[fo.DatasetView] = None,
+    half: bool = True,
+) -> dict:
+    """
+    SAM3 辅助标注，三种提示策略：
+
+    - text:        SAM3SemanticPredictor + text prompt → 概念分割
+    - box_example: SAM3SemanticPredictor + bboxes (图像范例) → 概念匹配
+    - box_visual:  ultralytics.SAM + 扩展框 → SAM2 兼容视觉分割 (逐多边形)
+    """
+    target = view if view is not None else ds
+    stats = defaultdict(int)
+
+    if prompt_mode == "text":
+        _sam3_text_predict(
+            target, model_path, pred_field, conf_threshold, output_mode,
+            text_prompts, label_name, skip_labeled, nms_iou, fail_tag, half, stats,
+        )
+    elif prompt_mode == "box_example":
+        _sam3_box_example_predict(
+            target, model_path, pred_field, conf_threshold, output_mode,
+            box_source_field, box_source_label, box_expand_ratio,
+            label_name, skip_labeled, nms_iou, fail_tag, half, stats,
+        )
+    elif prompt_mode == "box_visual":
+        _sam_box_visual_predict(
+            target, model_path, pred_field, conf_threshold, output_mode,
+            box_source_field, box_source_label, box_expand_ratio, box_mask_strategy,
+            label_name, skip_labeled, nms_iou, fail_tag, stats,
+        )
+    else:
+        raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
+
+    logger.info("SAM 预标注完成: %s", dict(stats))
+    return dict(stats)
+
+
+# ── Text prompt ──────────────────────────────────────────────
+
+def _sam3_text_predict(
+    target, model_path, pred_field, conf_threshold, output_mode,
+    text_prompts, label_name, skip_labeled, nms_iou, fail_tag, half, stats,
+):
+    """Text prompt：SAM3SemanticPredictor 概念分割。"""
+    from ultralytics.models.sam import SAM3SemanticPredictor
+
+    overrides = dict(
+        conf=conf_threshold, task="segment", mode="predict",
+        model=model_path, half=half, save=False,
+    )
+    predictor = SAM3SemanticPredictor(overrides=overrides)
+
+    for sample in target.iter_samples(progress=True, autosave=True):
+        existing_items = _read_existing_items(sample, pred_field, output_mode)
+        if skip_labeled and existing_items:
+            stats["skipped_labeled"] += 1
+            continue
+
+        try:
+            predictor.set_image(sample.filepath)
+            if not text_prompts:
+                stats["errors"] += 1
+                continue
+            results = predictor(text=text_prompts)
+        except Exception as e:
+            logger.warning("SAM3 text 预测失败 (%s): %s", sample.filepath, e)
+            stats["errors"] += 1
+            _tag_fail(sample, fail_tag, stats)
+            continue
+
+        has_output = _process_sam_results(
+            results, sample, pred_field, existing_items, output_mode,
+            label_name, nms_iou, stats,
+        )
+        if not has_output:
+            _tag_fail(sample, fail_tag, stats)
+        stats["images_processed"] += 1
+
+    predictor.reset_prompts()
+
+
+# ── Box example prompt (概念匹配，推荐) ──────────────────────
+
+def _extract_source_bboxes_px(
+    sample, box_source_field: str, box_source_label: Optional[str],
+    w_img: int, h_img: int,
+) -> list[list[float]]:
+    """从样本的来源字段提取像素级 xyxy bboxes。"""
+    if not sample.has_field(box_source_field):
+        return []
+    source = sample[box_source_field]
+    if source is None:
+        return []
+    items = getattr(source, "polylines", None) or getattr(source, "detections", None) or []
+    if box_source_label:
+        items = [it for it in items if getattr(it, "label", None) == box_source_label]
+
+    bboxes = []
+    for it in items:
+        if hasattr(it, "points") and it.points:
+            pts = it.points[0]
+            xs = [p[0] * w_img for p in pts]
+            ys = [p[1] * h_img for p in pts]
+            bboxes.append([min(xs), min(ys), max(xs), max(ys)])
+        elif hasattr(it, "bounding_box") and it.bounding_box:
+            bb = it.bounding_box
+            bboxes.append([bb[0] * w_img, bb[1] * h_img,
+                           (bb[0] + bb[2]) * w_img, (bb[1] + bb[3]) * h_img])
+    return bboxes
+
+
+def _expand_bbox(bbox: list[float], ratio: float,
+                 w_img: int, h_img: int) -> list[float]:
+    """对 xyxy bbox 按比例四周扩展并 clamp 到图像边界。"""
+    x1, y1, x2, y2 = bbox
+    bw, bh = x2 - x1, y2 - y1
+    return [
+        max(0.0, x1 - bw * ratio),
+        max(0.0, y1 - bh * ratio),
+        min(float(w_img), x2 + bw * ratio),
+        min(float(h_img), y2 + bh * ratio),
+    ]
+
+
+def _sam3_box_example_predict(
+    target, model_path, pred_field, conf_threshold, output_mode,
+    box_source_field, box_source_label, expand_ratio,
+    label_name, skip_labeled, nms_iou, fail_tag, half, stats,
+):
+    """Box example prompt：SAM3SemanticPredictor + bboxes 图像范例。
+
+    与 text prompt 使用同一个 predictor，区别在于用 bboxes= 而非 text=。
+    SAM3 会把 bbox 内的内容当作"概念范例"，找出图像中所有相似实例。
+    bbox 会按 expand_ratio 扩展，确保 SAM3 能看到超出来源多边形的完整目标。
+    """
+    from ultralytics.models.sam import SAM3SemanticPredictor
+
+    overrides = dict(
+        conf=conf_threshold, task="segment", mode="predict",
+        model=model_path, half=half, save=False,
+    )
+    predictor = SAM3SemanticPredictor(overrides=overrides)
+
+    for sample in target.iter_samples(progress=True, autosave=True):
+        existing_items = _read_existing_items(sample, pred_field, output_mode)
+        if skip_labeled and existing_items:
+            stats["skipped_labeled"] += 1
+            continue
+
+        img = cv2.imread(sample.filepath)
+        if img is None:
+            stats["errors"] += 1
+            continue
+        h_img, w_img = img.shape[:2]
+
+        raw_bboxes = _extract_source_bboxes_px(
+            sample, box_source_field, box_source_label, w_img, h_img,
+        )
+        if not raw_bboxes:
+            stats["no_source_items"] += 1
+            continue
+
+        expanded = [_expand_bbox(bb, expand_ratio, w_img, h_img) for bb in raw_bboxes]
+
+        try:
+            predictor.set_image(sample.filepath)
+            results = predictor(bboxes=expanded)
+        except Exception as e:
+            logger.warning("SAM3 box example 预测失败 (%s): %s", sample.filepath, e)
+            stats["errors"] += 1
+            _tag_fail(sample, fail_tag, stats)
+            continue
+
+        has_output = _process_sam_results(
+            results, sample, pred_field, existing_items, output_mode,
+            label_name, nms_iou, stats,
+        )
+        if not has_output:
+            _tag_fail(sample, fail_tag, stats)
+        stats["images_processed"] += 1
+
+    predictor.reset_prompts()
+
+
+# ── Box visual prompt (SAM2 兼容，逐多边形) ───────────────────
+
+def _sam_box_visual_predict(
+    target, model_path, pred_field, conf_threshold, output_mode,
+    box_source_field, box_source_label, expand_ratio, mask_strategy,
+    label_name, skip_labeled, nms_iou, fail_tag, stats,
+):
+    """Box visual prompt：ultralytics.SAM (SAM2 兼容) 逐多边形视觉分割。
+
+    与 box_example 不同，这里对每个来源多边形单独调用 SAM，
+    让模型分割扩展框内的特定目标，而不是查找所有相似实例。
+    """
+    from ultralytics import SAM
+
+    model = SAM(model_path)
+
+    for sample in target.iter_samples(progress=True, autosave=True):
+        existing_items = _read_existing_items(sample, pred_field, output_mode)
+        if skip_labeled and existing_items:
+            stats["skipped_labeled"] += 1
+            continue
+
+        if not sample.has_field(box_source_field):
+            stats["no_source_field"] += 1
+            continue
+        source = sample[box_source_field]
+        if source is None:
+            stats["no_source_field"] += 1
+            continue
+
+        items = getattr(source, "polylines", None) or getattr(source, "detections", None) or []
+        if box_source_label:
+            items = [it for it in items if getattr(it, "label", None) == box_source_label]
+        if not items:
+            stats["no_source_items"] += 1
+            continue
+
+        img = cv2.imread(sample.filepath)
+        if img is None:
+            stats["errors"] += 1
+            continue
+        h_img, w_img = img.shape[:2]
+
+        new_items = []
+        for it in items:
+            if hasattr(it, "points") and it.points:
+                pts_px = [(p[0] * w_img, p[1] * h_img) for p in it.points[0]]
+            elif hasattr(it, "bounding_box") and it.bounding_box:
+                bb = it.bounding_box
+                x1, y1 = bb[0] * w_img, bb[1] * h_img
+                x2, y2 = (bb[0] + bb[2]) * w_img, (bb[1] + bb[3]) * h_img
+                pts_px = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            else:
+                continue
+
+            xs = [p[0] for p in pts_px]
+            ys = [p[1] for p in pts_px]
+            raw_bb = [min(xs), min(ys), max(xs), max(ys)]
+            ex1, ey1, ex2, ey2 = _expand_bbox(raw_bb, expand_ratio, w_img, h_img)
+
+            try:
+                results = model(
+                    sample.filepath,
+                    bboxes=[[ex1, ey1, ex2, ey2]],
+                    verbose=False,
+                )
+            except Exception as e:
+                logger.warning("SAM box visual 预测失败 (%s): %s", sample.filepath, e)
+                stats["errors"] += 1
+                continue
+
+            if not results or results[0].masks is None:
+                stats["errors"] += 1
+                continue
+
+            masks = results[0].masks.data.cpu().numpy()
+            if masks.shape[0] == 0:
+                stats["errors"] += 1
+                continue
+
+            best_idx = _select_best_mask(masks, pts_px, strategy=mask_strategy)
+            if best_idx is None:
+                stats["errors"] += 1
+                continue
+
+            mask_np = (masks[best_idx] > 0.5).astype(np.uint8)
+            conf_val = 1.0
+            if results[0].boxes is not None and best_idx < len(results[0].boxes):
+                box_r = results[0].boxes[best_idx]
+                if hasattr(box_r, "conf") and box_r.conf is not None:
+                    conf_val = float(box_r.conf[0])
+
+            item = _mask_to_output_item(mask_np, label_name, conf_val, output_mode)
+            if item is None:
+                stats["skipped_small_mask"] += 1
+                continue
+            new_items.append(item)
+            stats["detected"] += 1
+
+        has_output = _save_items_with_nms(
+            sample, pred_field, existing_items, new_items,
+            output_mode, nms_iou, stats,
+        )
+        if not has_output:
+            _tag_fail(sample, fail_tag, stats)
+        stats["images_processed"] += 1
+
+
+# ── 共用结果处理 ──────────────────────────────────────────────
+
+def _process_sam_results(
+    results, sample, pred_field, existing_items, output_mode,
+    label_name, nms_iou, stats,
+) -> bool:
+    """处理 SAM3 predictor 返回的 results，统一用于 text 和 box_example 两种模式。"""
+    if not results:
+        return False
+
+    result = results[0]
+    if result.masks is None or result.masks.data is None:
+        return False
+
+    masks_tensor = result.masks.data
+    boxes_result = result.boxes
+
+    new_items = []
+    for mi in range(masks_tensor.shape[0]):
+        mask_np = masks_tensor[mi].cpu().numpy().astype(np.uint8)
+        conf_val = 1.0
+        if boxes_result is not None and mi < len(boxes_result):
+            box = boxes_result[mi]
+            if hasattr(box, "conf") and box.conf is not None:
+                conf_val = float(box.conf[0])
+
+        item = _mask_to_output_item(mask_np, label_name, conf_val, output_mode)
+        if item is None:
+            stats["skipped_small_mask"] += 1
+            continue
+        new_items.append(item)
+        stats["detected"] += 1
+
+    return _save_items_with_nms(
+        sample, pred_field, existing_items, new_items,
+        output_mode, nms_iou, stats,
+    )
+
+
+def clear_tag_from_dataset(
+    ds: fo.Dataset,
+    tag: str,
+    view: Optional[fo.DatasetView] = None,
+) -> int:
+    """从数据集（或视图）中清除指定标签，返回受影响样本数。"""
+    target = view if view is not None else ds
+    tagged = target.match_tags(tag)
+    count = len(tagged)
+    if count > 0:
+        for sample in tagged.iter_samples(progress=True, autosave=True):
+            if tag in sample.tags:
+                sample.tags.remove(tag)
+    logger.info("已从 %d 个样本中清除标签 '%s'", count, tag)
+    return count
