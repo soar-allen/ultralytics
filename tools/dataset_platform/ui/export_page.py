@@ -9,7 +9,7 @@ from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import exporter
 from tools.dataset_platform import trainer
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _get_ds, _path_browser
+from tools.dataset_platform.ui.components import _get_ds, _get_info, _path_browser
 
 
 def _render_export():
@@ -55,7 +55,7 @@ def _render_export():
         single_split = st.selectbox("Split 名称", ["train", "valid", "test"], key="export_split")
         splits = single_split
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
     label_field = st.selectbox("标签字段", info.get("label_fields", ["ground_truth"]), key="export_label_field")
 
     all_tags = sorted(ds.distinct("tags"))

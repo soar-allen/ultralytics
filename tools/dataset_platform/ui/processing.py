@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import processor
-from tools.dataset_platform.ui.components import _get_ds
+from tools.dataset_platform.ui.components import _get_ds, _get_info
 
 
 # ===================================================================
@@ -30,7 +30,7 @@ def _render_processing():
 def _render_bad_polylines(ds):
     st.subheader("多边形处理")
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
     poly_fields = [f for f in info.get("label_fields", []) if dm.get_field_label_type(ds, f) == "polylines"]
 
     if not poly_fields:
@@ -336,7 +336,7 @@ def _render_field_merge(ds):
         "标注完成后需要汇总到统一字段（如 `ground_truth`）。"
     )
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
     label_fields = info.get("label_fields", [])
     all_fields = info.get("sample_fields", [])
 

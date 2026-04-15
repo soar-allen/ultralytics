@@ -14,7 +14,7 @@ import streamlit as st
 
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import processor
-from tools.dataset_platform.ui.components import _get_ds, _path_browser
+from tools.dataset_platform.ui.components import _get_ds, _get_info, _path_browser
 
 _MODEL_DIR = Path.home() / ".dataset_platform" / "model"
 _MODEL_EXTENSIONS = (".pt", ".pth", ".onnx", ".engine")
@@ -147,7 +147,7 @@ def _render_auto_predict_page():
 
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
     col_overview, col_unlabeled = st.columns(2)
     with col_overview:
         st.metric("📷 数据集样本数", info["num_samples"])

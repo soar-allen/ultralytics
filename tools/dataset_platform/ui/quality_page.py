@@ -4,7 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from tools.dataset_platform import data_manager as dm
-from tools.dataset_platform.ui.components import _get_ds
+from tools.dataset_platform.ui.components import _get_ds, _get_info
 
 
 def _render_quality_page():
@@ -14,7 +14,7 @@ def _render_quality_page():
         st.info("请先选择数据集")
         return
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
     label_fields = info.get("label_fields", [])
     if not label_fields:
         st.warning("当前数据集没有标签字段")

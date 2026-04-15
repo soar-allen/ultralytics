@@ -4,13 +4,39 @@ import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import cvat_sync
 from tools.dataset_platform.config import CONFIG, save_config
-from tools.dataset_platform.ui.components import _get_ds
+from tools.dataset_platform.ui.components import _get_ds, _list_datasets_cached, _get_info
+
+
+_PAGES = (
+    "📊 Data Hub",
+    "📥 数据导入",
+    "🧹 处理清洗",
+    "🤖 自动预标注",
+    "🔄 CVAT 同步",
+    "📤 数据导出",
+    "🏋️ 训练管理",
+    "🔬 质量检查",
+    "🧠 高级功能",
+)
 
 
 def _render_sidebar():
     st.sidebar.title("📦 数据集管理")
 
-    datasets = dm.list_datasets()
+    # --- 页面导航 ---
+    if "_active_page" not in st.session_state:
+        st.session_state["_active_page"] = _PAGES[0]
+    cur_idx = _PAGES.index(st.session_state["_active_page"]) if st.session_state["_active_page"] in _PAGES else 0
+    selected_page = st.sidebar.radio(
+        "页面导航", _PAGES, index=cur_idx, key="_page_nav",
+    )
+    if selected_page != st.session_state["_active_page"]:
+        st.session_state["_active_page"] = selected_page
+        st.rerun()
+
+    st.sidebar.markdown("---")
+
+    datasets = _list_datasets_cached()
 
     if datasets:
         idx = 0
@@ -127,15 +153,9 @@ def _render_sidebar():
     st.sidebar.markdown("---")
     ds = _get_ds()
     if ds:
-        info = dm.get_dataset_info(ds)
+        info = _get_info(ds)
         st.sidebar.metric("样本数", info["num_samples"])
         st.sidebar.caption(f"标签字段: {', '.join(info['label_fields']) or '无'}")
-
-        all_classes = []
-        for lf in info["label_fields"]:
-            all_classes.extend(dm.get_label_classes(ds, lf))
-        unique_classes = sorted(set(all_classes))
-        st.sidebar.caption(f"标注类别: {', '.join(unique_classes) or '无'}")
         if info["tags"]:
             st.sidebar.caption(f"样本标签: {', '.join(info['tags'][:10])}")
 

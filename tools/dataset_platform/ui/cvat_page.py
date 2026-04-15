@@ -6,7 +6,7 @@ import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import cvat_sync
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _get_ds
+from tools.dataset_platform.ui.components import _get_ds, _get_info
 
 
 def _render_cvat_sync():
@@ -75,7 +75,7 @@ def _render_cvat_push(ds):
         help="CVAT 中的 Project 名称。",
     )
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
     label_fields = info.get("label_fields", [])
 
     st.markdown("**标签字段**")

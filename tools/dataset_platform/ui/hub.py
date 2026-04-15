@@ -4,7 +4,7 @@ import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import cvat_sync
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _get_ds
+from tools.dataset_platform.ui.components import _get_ds, _get_info
 
 
 def _render_data_hub():
@@ -14,7 +14,7 @@ def _render_data_hub():
         st.info("请先在侧边栏选择或创建数据集")
         return
 
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
 
     tab_stats, tab_tags_filter, tab_label_mgmt = st.tabs([
         "📊 数据集统计", "🔎 标签筛选与查看", "🏷️ 标签管理",
@@ -92,18 +92,14 @@ def _render_hub_statistics(ds, info: dict):
     st.markdown("---")
     st.subheader("🔖 样本 Tags 统计")
 
-    available_tags = ds.distinct("tags")
+    available_tags = info["tags"]
     if available_tags:
-        tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
+        tag_counts = ds.count_values("tags")
+        tag_counts.pop(None, None)
         if tag_counts:
             df_tags = pd.DataFrame(
                 list(tag_counts.items()), columns=["标签", "样本数"]
             ).sort_values("样本数", ascending=False)
-
-            has_dup = any(
-                len(s.tags) != len(set(s.tags))
-                for s in ds.select_fields("tags").iter_samples()
-            )
 
             chart_col, table_col = st.columns([2, 1])
             with chart_col:
@@ -113,11 +109,6 @@ def _render_hub_statistics(ds, info: dict):
                 st.caption(
                     f"共 **{len(tag_counts)}** 种标签，"
                     f"一个样本可拥有多个标签"
-                )
-            if has_dup:
-                st.warning(
-                    "⚠️ 检测到部分样本存在**重复 Tags**（同一标签出现多次），"
-                    "这可能由重复运行质量检查等操作导致。请使用下方的『修复重复Tags』功能清理。"
                 )
     else:
         st.info("当前数据集没有任何样本 Tags")
@@ -192,7 +183,7 @@ def _render_hub_tag_filter(ds, info: dict):
         "Tags 来源包括：导入时的批次标签、CVAT Job 状态标记、手动添加的标签等。"
     )
 
-    available_tags = ds.distinct("tags")
+    available_tags = info["tags"]
     if not available_tags:
         st.info("当前数据集没有任何 Tags。可以在「标签管理」中添加，或在导入数据时指定批次标签。")
         return
@@ -286,8 +277,8 @@ def _render_label_management(ds):
     st.subheader("样本标签 (Tags) 管理")
     st.caption("给已有样本批量添加或移除 Tags（如批次标记、审核状态等）")
 
-    available_tags = ds.distinct("tags")
-    info = dm.get_dataset_info(ds)
+    info = _get_info(ds)
+    available_tags = info["tags"]
     label_fields = info.get("label_fields", [])
 
     tag_scope = st.radio(
@@ -379,8 +370,6 @@ def _render_label_management(ds):
 
     # ---- 标注类别操作 ----
     st.markdown("---")
-    info = dm.get_dataset_info(ds)
-    label_fields = info.get("label_fields", [])
     if not label_fields:
         st.info("当前数据集没有标签字段，请先导入标注数据")
         return

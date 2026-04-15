@@ -129,7 +129,6 @@ def _render_brain(ds):
                     st.error(f"计算失败: {e}")
 
         if "uniqueness" in ds.get_field_schema():
-            from fiftyone import ViewField as F
             col1, col2 = st.columns(2)
             with col1:
                 n_dup = st.number_input("显示最相似（最不唯一）的 N 个", value=20, key="uniq_n_dup")
@@ -148,16 +147,16 @@ def _render_brain(ds):
                         dm.set_session_view(view)
                         st.success(f"✅ 已展示 uniqueness 最高的 {n_unique} 个样本")
 
-            import fiftyone as fo_agg
-            try:
-                mean_val = ds.mean("uniqueness")
-                bounds = ds.bounds("uniqueness")
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("平均值", f"{mean_val:.3f}" if mean_val is not None else "N/A")
-                mc2.metric("最小值", f"{bounds[0]:.3f}" if bounds and bounds[0] is not None else "N/A")
-                mc3.metric("最大值", f"{bounds[1]:.3f}" if bounds and bounds[1] is not None else "N/A")
-            except Exception:
-                pass
+            if st.button("📊 查看统计", key="btn_uniq_stats"):
+                try:
+                    mean_val = ds.mean("uniqueness")
+                    bounds = ds.bounds("uniqueness")
+                    mc1, mc2, mc3 = st.columns(3)
+                    mc1.metric("平均值", f"{mean_val:.3f}" if mean_val is not None else "N/A")
+                    mc2.metric("最小值", f"{bounds[0]:.3f}" if bounds and bounds[0] is not None else "N/A")
+                    mc3.metric("最大值", f"{bounds[1]:.3f}" if bounds and bounds[1] is not None else "N/A")
+                except Exception:
+                    st.warning("统计计算失败")
 
     with tab_hardness:
         st.markdown("""
