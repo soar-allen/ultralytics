@@ -246,6 +246,8 @@ def backup_dataset(
     copied = 0
     failed = 0
     failed_paths: list[str] = []
+    # 记录 原始路径 → 备份文件名 的映射，解决同名文件冲突
+    filepath_map: dict[str, str] = {}
     filepaths = ds.values("filepath")
     for fp in filepaths:
         src = Path(fp)
@@ -259,6 +261,7 @@ def backup_dataset(
                 counter += 1
         try:
             shutil.copy2(str(src), str(dst))
+            filepath_map[fp] = dst.name
             copied += 1
         except Exception as e:
             failed += 1
@@ -275,6 +278,12 @@ def backup_dataset(
         metadata_exported = True
     except Exception as e:
         logger.error("导出 FiftyOne 元数据失败: %s", e)
+
+    # 保存路径映射表，供导入时精确恢复
+    filepath_map_file = backup_dir / "filepath_map.json"
+    filepath_map_file.write_text(
+        json.dumps(filepath_map, ensure_ascii=False), encoding="utf-8",
+    )
 
     from .data_manager import get_dataset_info, get_label_stats
     info = get_dataset_info(ds)
@@ -433,11 +442,21 @@ def import_from_backup(
         raise RuntimeError(f"加载备份元数据失败: {e}") from e
 
     try:
-        # 重映射 filepath → backup_dir/images/
-        if images_dir.is_dir():
-            image_files = {p.name: str(p) for p in images_dir.iterdir() if p.is_file()}
+        # 加载路径映射表（新版备份）或回退到按文件名匹配（旧版备份）
+        fp_map_file = backup_dir / "filepath_map.json"
+        if fp_map_file.exists():
+            fp_map: dict[str, str] = json.loads(
+                fp_map_file.read_text(encoding="utf-8")
+            )
         else:
-            image_files = {}
+            fp_map = {}
+
+        if images_dir.is_dir():
+            image_files_by_name = {
+                p.name: str(p) for p in images_dir.iterdir() if p.is_file()
+            }
+        else:
+            image_files_by_name = {}
 
         existing_fps = set(target_ds.values("filepath"))
 
@@ -446,11 +465,18 @@ def import_from_backup(
         samples_to_add = []
 
         for sample in tmp_ds.iter_samples():
-            orig_name = Path(sample.filepath).name
-            if orig_name in image_files:
-                new_fp = image_files[orig_name]
+            orig_fp = sample.filepath
+
+            if fp_map and orig_fp in fp_map:
+                # 新版备份：通过精确映射查找备份文件
+                backup_name = fp_map[orig_fp]
+                new_fp = image_files_by_name.get(
+                    backup_name, orig_fp,
+                )
             else:
-                new_fp = sample.filepath
+                # 旧版备份兼容：按原始文件名查找
+                orig_name = Path(orig_fp).name
+                new_fp = image_files_by_name.get(orig_name, orig_fp)
 
             if new_fp in existing_fps:
                 skipped_dup += 1

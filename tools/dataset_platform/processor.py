@@ -151,21 +151,103 @@ def find_corrupt_or_abnormal(
 # 2b. 多边形处理（转四角 / 边界检测）
 # ===================================================================
 
-def _extract_quad(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """从任意多边形顶点中提取 tl/tr/br/bl 四个极角点。"""
+def _dedup_points(arr: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+    """去除距离 < tol 的重复顶点。"""
+    if len(arr) == 0:
+        return arr
+    keep = [0]
+    for i in range(1, len(arr)):
+        if all(np.linalg.norm(arr[i] - arr[j]) > tol for j in keep):
+            keep.append(i)
+    return arr[keep]
+
+
+def _order_quad_points(arr: np.ndarray) -> list[tuple[float, float]]:
+    """
+    将 4 个点排序为 tl→tr→br→bl（顺时针），保证不会形成交叉（倒 8 字形）。
+
+    算法：以质心为原点，按 atan2 角度升序排列。在图像坐标系（y 向下）中，
+    atan2 升序天然给出顺时针序列，再旋转使 x+y 最小的点（最靠近左上角）
+    排在首位，即得 tl→tr→br→bl。
+    """
+    cx, cy = arr.mean(axis=0)
+    angles = np.arctan2(arr[:, 1] - cy, arr[:, 0] - cx)
+    order = np.argsort(angles)
+    sorted_pts = arr[order]
+
+    start = int(np.argmin(sorted_pts.sum(axis=1)))
+    sorted_pts = np.roll(sorted_pts, -start, axis=0)
+
+    return [(float(p[0]), float(p[1])) for p in sorted_pts]
+
+
+def _best_quad_from_hull(hull_pts: np.ndarray) -> np.ndarray:
+    """
+    从凸包 (≥4 个有序顶点) 中选出面积最大的 4 点四边形。
+
+    凸包顶点已按顺序排列，所以任意 4 个子集按原序构成凸四边形，
+    Shoelace 面积计算正确。典型标注多边形凸包 ≤ 20 点，C(20,4)=4845 完全可行。
+    """
+    from itertools import combinations
+
+    n = len(hull_pts)
+    best_area = -1.0
+    best_quad = hull_pts[:4]
+    for idx in combinations(range(n), 4):
+        quad = hull_pts[list(idx)]
+        x, y = quad[:, 0], quad[:, 1]
+        area = 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+        if area > best_area:
+            best_area = area
+            best_quad = quad
+    return best_quad
+
+
+def _extract_quad(pts: list[tuple[float, float]]) -> list[tuple[float, float]] | None:
+    """
+    从 N 点多边形中提取最优 4 点四边形 (tl→tr→br→bl)。
+
+    算法流程：
+      1. 去除重复顶点
+      2. 若 < 4 个独立点 → 返回 None (无法构成四边形)
+      3. 若恰好 4 个 → 直接排序
+      4. 若 > 4 个 → 取凸包，从凸包中选面积最大的 4 点组合
+      5. 对结果做退化检验，不合格则返回 None
+
+    Returns:
+        4 元素 list 或 None（退化时）
+    """
     arr = np.array(pts, dtype=np.float64)
-    s = arr.sum(axis=1)
-    d = arr[:, 0] - arr[:, 1]
-    tl = arr[int(np.argmin(s))]
-    br = arr[int(np.argmax(s))]
-    tr = arr[int(np.argmax(d))]
-    bl = arr[int(np.argmin(d))]
-    return [
-        (float(tl[0]), float(tl[1])),
-        (float(tr[0]), float(tr[1])),
-        (float(br[0]), float(br[1])),
-        (float(bl[0]), float(bl[1])),
-    ]
+    arr = _dedup_points(arr)
+
+    if len(arr) < 4:
+        return None
+
+    if len(arr) == 4:
+        quad = arr
+    else:
+        hull = cv2.convexHull(arr.astype(np.float32).reshape(-1, 1, 2))
+        hull_pts = hull.reshape(-1, 2).astype(np.float64)
+        hull_pts = _dedup_points(hull_pts)
+        if len(hull_pts) < 4:
+            return None
+        if len(hull_pts) == 4:
+            quad = hull_pts
+        else:
+            quad = _best_quad_from_hull(hull_pts)
+
+    ordered = _order_quad_points(quad)
+
+    # 退化检验：任意两点距离 / 最长距离 < 2%
+    oarr = np.array(ordered)
+    dists = []
+    for i in range(4):
+        for j in range(i + 1, 4):
+            dists.append(float(np.linalg.norm(oarr[j] - oarr[i])))
+    if max(dists) < 1e-9 or min(dists) / max(dists) < 0.02:
+        return None
+
+    return ordered
 
 
 def convert_polylines_to_quads(
@@ -173,13 +255,14 @@ def convert_polylines_to_quads(
     label_field: str,
 ) -> dict:
     """
-    将多边形标注转换为四角多边形（取 tl/tr/br/bl 四个极角点）。
+    将多边形标注转换为四角多边形。
 
-    对点数 < 4 的多边形跳过，点数 == 4 的保持不变（仅重新排序），
-    点数 > 4 的提取四个极角点。
+    算法：凸包 → 最大面积 4 点子集 → 排序为 tl→tr→br→bl。
+    对退化结果（三角形 / 线段）保留原始多边形并计入 degenerate。
 
     Returns:
-        {"converted": int, "skipped_few_pts": int, "already_quad": int, "total_polys": int}
+        {"converted": int, "reordered": int, "skipped_few_pts": int,
+         "degenerate": int, "total_polys": int}
     """
     stats = defaultdict(int)
 
@@ -198,70 +281,185 @@ def convert_polylines_to_quads(
                 if len(ring) < 4:
                     stats["skipped_few_pts"] += 1
                     new_rings.append(ring)
+                    continue
+
+                result = _extract_quad(ring)
+                if result is None:
+                    stats["degenerate"] += 1
+                    new_rings.append(ring)
                 elif len(ring) == 4:
-                    stats["already_quad"] += 1
-                    new_rings.append(_extract_quad(ring))
+                    stats["reordered"] += 1
+                    new_rings.append(result)
                 else:
                     stats["converted"] += 1
-                    new_rings.append(_extract_quad(ring))
+                    new_rings.append(result)
             poly.points = new_rings
 
     logger.info("多边形转四角: %s (field=%s)", dict(stats), label_field)
     return dict(stats)
 
 
-def find_boundary_polylines(
+def _quad_quality(pts: list[tuple[float, float]]) -> dict:
+    """
+    评估一个四角多边形的几何质量。
+
+    核心思路：透视变形下的正常托盘面内角可能很小（15°）或很大（165°），
+    这些都是正常的。只有当两点几乎重合导致四边形退化为三角形、面积趋零、
+    或形状完全塌缩时才判定为不合格。
+    """
+    import math
+
+    arr = np.array(pts, dtype=np.float64)
+    n = len(arr)
+
+    # -- 所有顶点间的成对距离 (4C2 = 6 对) --
+    pairwise = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairwise.append(float(np.linalg.norm(arr[j] - arr[i])))
+
+    # -- 边长 (4条) --
+    sides = [float(np.linalg.norm(arr[(i + 1) % n] - arr[i])) for i in range(n)]
+    perimeter = sum(sides)
+    min_side = min(sides)
+    max_side = max(sides)
+    side_ratio = min_side / max_side if max_side > 1e-9 else 0.0
+
+    min_pair = min(pairwise)
+    max_pair = max(pairwise)
+    pair_ratio = min_pair / max_pair if max_pair > 1e-9 else 0.0
+
+    # -- 内角 --
+    angles = []
+    for i in range(n):
+        v1 = arr[(i - 1) % n] - arr[i]
+        v2 = arr[(i + 1) % n] - arr[i]
+        denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if denom < 1e-12:
+            angles.append(0.0)
+            continue
+        cos_a = float(np.clip(np.dot(v1, v2) / denom, -1.0, 1.0))
+        angles.append(math.degrees(math.acos(cos_a)))
+
+    # -- 面积 (Shoelace) --
+    x, y = arr[:, 0], arr[:, 1]
+    area = 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+    # -- 紧凑度 = 面积 / (周长/4)² 完美正方形=1, 退化条状→0 --
+    compactness = area / ((perimeter / 4) ** 2) if perimeter > 1e-9 else 0.0
+
+    return {
+        "min_side": min_side,
+        "max_side": max_side,
+        "side_ratio": side_ratio,
+        "pair_ratio": pair_ratio,
+        "min_angle_deg": min(angles) if angles else 0.0,
+        "max_angle_deg": max(angles) if angles else 0.0,
+        "area": area,
+        "compactness": compactness,
+        "perimeter": perimeter,
+    }
+
+
+def find_bad_pallet_polylines(
     ds: fo.Dataset | fo.DatasetView,
     label_field: str,
-    edge_threshold: float = 0.005,
     tag: str = "bad_polygon",
-) -> list[str]:
+    classes: list[str] | None = None,
+    pair_ratio_min: float = 0.02,
+    area_min: float = 5e-5,
+    compactness_min: float = 0.01,
+    angle_min: float = 5.0,
+    angle_max: float = 178.0,
+) -> dict:
     """
-    标记「单多边形 + 角点贴近图像边界」的样本。
+    检测不合格的托盘多边形并标记。
 
-    判定条件（同时满足）：
-      1. 样本在 label_field 中只有 1 个多边形
-      2. 该多边形的 4 个顶点中有 ≥1 个顶点的归一化坐标
-         贴近边界（x < threshold 或 x > 1-threshold 或 y 同理）
+    设计理念：透视变形下的正常托盘面内角范围很宽（可达 10°~170°），
+    边长差异也很大，这些都是正常的。此函数仅捕获真正退化的形状：
+
+      1. 不是 4 个顶点
+      2. 任意两点距离 / 最长距离 < pair_ratio_min → 点重合，退化三角形
+      3. 面积 < area_min → 形状塌缩
+      4. 紧凑度 < compactness_min → 极端细条
+      5. 内角 < angle_min 或 > angle_max → 几乎完全折叠
 
     Args:
-        edge_threshold: 归一化阈值，默认 0.005（约为 1000px 图像的 5px）
+        classes: 仅检测指定类别，None 则检测全部
+        pair_ratio_min: 最近点对距离/最远点对距离 (默认 0.02，极其宽松)
+        area_min: 最小面积 (归一化坐标，默认 5e-5)
+        compactness_min: 面积 / (周长/4)² 的最小值 (默认 0.01)
+        angle_min / angle_max: 内角范围 (默认 5°~178°，仅捕获几乎折叠)
 
     Returns:
-        被标记的 sample ID 列表
+        {"bad_ids": list, "total_checked": int, "not_quad": int,
+         "bad_geometry": int, "reasons": dict[str, int]}
     """
-    bad_ids = []
+    bad_ids: list[str] = []
+    reasons: dict[str, int] = {}
+    total_checked = 0
+    not_quad = 0
+    bad_geometry = 0
+    class_set = set(classes) if classes else None
 
     for sample in ds.iter_samples(progress=True):
-        container = sample[label_field]
+        container = sample[label_field] if sample.has_field(label_field) else None
         if container is None:
             continue
         polylines = getattr(container, "polylines", None)
-        if not polylines or len(polylines) != 1:
+        if not polylines:
             continue
 
-        ring = polylines[0].points[0] if polylines[0].points else []
-        if len(ring) != 4:
-            continue
+        sample_bad = False
+        for poly in polylines:
+            if class_set and poly.label not in class_set:
+                continue
+            total_checked += 1
+            ring = poly.points[0] if poly.points else []
 
-        on_boundary = False
-        for x, y in ring:
-            if (x < edge_threshold or x > 1.0 - edge_threshold
-                    or y < edge_threshold or y > 1.0 - edge_threshold):
-                on_boundary = True
-                break
+            if len(ring) != 4:
+                not_quad += 1
+                sample_bad = True
+                r = f"非四角多边形 ({len(ring)}点)"
+                reasons[r] = reasons.get(r, 0) + 1
+                continue
 
-        if on_boundary:
+            qr = _quad_quality(ring)
+            reason = ""
+
+            if qr["pair_ratio"] < pair_ratio_min:
+                reason = f"两点几乎重合 (距离比 {qr['pair_ratio']:.4f})，退化三角形"
+            elif qr["area"] < area_min:
+                reason = f"面积过小 ({qr['area']:.6f})，形状塌缩"
+            elif qr["compactness"] < compactness_min:
+                reason = f"紧凑度过低 ({qr['compactness']:.4f})，极端细条"
+            elif qr["min_angle_deg"] < angle_min:
+                reason = f"内角近乎折叠 ({qr['min_angle_deg']:.1f}°)"
+            elif qr["max_angle_deg"] > angle_max:
+                reason = f"内角近乎展平 ({qr['max_angle_deg']:.1f}°)"
+
+            if reason:
+                bad_geometry += 1
+                sample_bad = True
+                reasons[reason] = reasons.get(reason, 0) + 1
+
+        if sample_bad:
             if tag not in sample.tags:
                 sample.tags.append(tag)
                 sample.save()
             bad_ids.append(sample.id)
 
     logger.info(
-        "边界多边形检测: %d 个样本 (threshold=%.4f, field=%s)",
-        len(bad_ids), edge_threshold, label_field,
+        "托盘多边形检测: %d bad / %d checked (field=%s)",
+        len(bad_ids), total_checked, label_field,
     )
-    return bad_ids
+    return {
+        "bad_ids": bad_ids,
+        "total_checked": total_checked,
+        "not_quad": not_quad,
+        "bad_geometry": bad_geometry,
+        "reasons": reasons,
+    }
 
 
 def clear_tag(ds: fo.Dataset, tag: str) -> int:

@@ -17,14 +17,16 @@ def _render_processing():
         st.info("请先选择数据集")
         return
 
-    tab_clean, tab_merge = st.tabs(
-        ["🧹 图像清理", "🔀 字段合并"],
+    tab_clean, tab_merge, tab_field_mgmt = st.tabs(
+        ["🧹 图像清理", "🔀 字段合并", "🗂️ 字段管理"],
     )
 
     with tab_clean:
         _render_cleaning(ds)
     with tab_merge:
         _render_field_merge(ds)
+    with tab_field_mgmt:
+        _render_field_management(ds)
 
 
 def _render_bad_polylines(ds):
@@ -51,31 +53,77 @@ def _render_bad_polylines(ds):
             st.info("当前数据集没有任何标签")
     st.caption(f"操作范围: **{len(bp_view)}** 个样本")
 
-    tab_convert, tab_boundary = st.tabs(["🔄 多边形转四角", "⚠️ 边界多边形检测"])
+    tab_convert, tab_pallet = st.tabs(["🔄 多边形转四角", "📐 托盘多边形检测"])
 
     # ---- Tab 1: 多边形转四角 ----
     with tab_convert:
         st.caption(
-            "将 N 点多边形转换为 4 点四边形：从所有顶点中提取左上 (tl)、右上 (tr)、"
-            "右下 (br)、左下 (bl) 四个极角点。已经是 4 点的多边形仅重新排序为 tl→tr→br→bl。"
+            "取凸包 → 选面积最大的 4 点子集 → 排序为 tl→tr→br→bl。"
+            "已经是 4 点的多边形仅重新排序。无法构成有效四边形的保留原样。"
         )
         if st.button("🔄 执行转换", key="btn_convert_quads"):
             with st.spinner(f"转换 {len(bp_view)} 个样本中..."):
                 stats = processor.convert_polylines_to_quads(bp_view, label_field=bp_field)
             st.success("转换完成")
-            st.json(stats)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("总多边形数", stats.get("total_polys", 0))
+            c2.metric("已转换 (>4点)", stats.get("converted", 0))
+            c3.metric("已重排 (4点)", stats.get("reordered", 0))
+            degen = stats.get("degenerate", 0)
+            c4.metric("退化/跳过", degen + stats.get("skipped_few_pts", 0))
+            if degen:
+                st.warning(f"{degen} 个多边形无法转换为有效四边形（点重复/共线），已保留原样")
 
-    # ---- Tab 2: 边界多边形检测 ----
-    with tab_boundary:
+    # ---- Tab 2: 托盘多边形检测 ----
+    with tab_pallet:
         st.caption(
-            "检测「单多边形 + 角点贴近图像边界」的样本：如果一张图片仅有 1 个四角多边形，"
-            "且任一顶点的归一化坐标贴近图像边缘（≈ 被截断），则标记为 `bad_polygon`。"
+            "检测不合格的托盘面多边形：非四角、退化三角形（两点过近）、"
+            "内角异常、非凸、面积过小等情况均标记为 `bad_polygon`。"
         )
-        edge_th = st.slider(
-            "边界阈值（归一化）", min_value=0.001, max_value=0.05, value=0.005, step=0.001,
-            key="bp_edge_threshold",
-            help="顶点坐标距边界小于此值即判定为贴近边界。0.005 ≈ 1000px 图像的 5px",
-        )
+
+        field_classes = sorted(dm.get_label_stats(ds, bp_field).keys())
+
+        bp_filter_class = st.checkbox("仅检测特定类别", key="bp_filter_class")
+        bp_classes = None
+        if bp_filter_class:
+            if field_classes:
+                bp_classes = st.multiselect("选择类别", field_classes, key="bp_classes")
+            else:
+                st.info(f"字段 `{bp_field}` 中暂无类别")
+
+        with st.expander("⚙️ 高级参数", expanded=False):
+            st.caption(
+                "默认参数非常宽松，只会捕获真正退化的多边形（如两点几乎重合导致的三角形）。"
+                "正常的透视变形不会被误判。"
+            )
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                bp_pair_ratio = st.slider(
+                    "最小点对距离比", 0.005, 0.10, 0.02, 0.005,
+                    key="bp_pair_ratio",
+                    help="任意两顶点最近距离 / 最远距离 < 此值 → 两点重合，退化三角形",
+                )
+                bp_angle_min = st.slider(
+                    "最小内角 (°)", 1.0, 30.0, 5.0, 1.0,
+                    key="bp_angle_min",
+                    help="内角 < 此值 → 几乎完全折叠（默认 5° 极宽松）",
+                )
+                bp_angle_max = st.slider(
+                    "最大内角 (°)", 160.0, 179.0, 178.0, 1.0,
+                    key="bp_angle_max",
+                    help="内角 > 此值 → 几乎展平（默认 178° 极宽松）",
+                )
+            with col_p2:
+                bp_area_min = st.number_input(
+                    "最小面积 (归一化)", 0.0, 0.01, 5e-5, 1e-5,
+                    format="%.5f", key="bp_area_min",
+                    help="Shoelace 面积 < 此值 → 形状塌缩",
+                )
+                bp_compact_min = st.slider(
+                    "最小紧凑度", 0.001, 0.10, 0.01, 0.005,
+                    key="bp_compact_min",
+                    help="面积/(周长/4)² < 此值 → 极端细条形",
+                )
 
         bad_tag = "bad_polygon"
         bad_count = len(ds.match_tags([bad_tag]))
@@ -96,7 +144,7 @@ def _render_bad_polylines(ds):
                             dm.delete_samples_physically(ds, ids)
                         else:
                             ds.delete_samples(ids)
-                    st.session_state["_toast_msg"] = f"已删除 {len(ids)} 个边界多边形样本"
+                    st.session_state["_toast_msg"] = f"已删除 {len(ids)} 个异常托盘多边形样本"
                     st.rerun()
             with bp_act2:
                 if st.button("🧹 清除 bad_polygon 标记", key="btn_clear_bad_poly",
@@ -106,15 +154,33 @@ def _render_bad_polylines(ds):
                     st.session_state["_toast_msg"] = f"已清除 {cleared} 个样本的 {bad_tag} 标记"
                     st.rerun()
 
-        if st.button("🔍 扫描边界多边形", key="btn_scan_bad_poly"):
+        if st.button("🔍 扫描不合格托盘多边形", key="btn_scan_bad_poly"):
             with st.spinner(f"扫描 {len(bp_view)} 个样本中..."):
-                bad_ids = processor.find_boundary_polylines(
-                    bp_view, label_field=bp_field, edge_threshold=edge_th, tag=bad_tag,
+                result = processor.find_bad_pallet_polylines(
+                    bp_view,
+                    label_field=bp_field,
+                    tag=bad_tag,
+                    classes=bp_classes if bp_classes else None,
+                    pair_ratio_min=bp_pair_ratio,
+                    area_min=bp_area_min,
+                    compactness_min=bp_compact_min,
+                    angle_min=bp_angle_min,
+                    angle_max=bp_angle_max,
                 )
+            bad_ids = result["bad_ids"]
             if bad_ids:
-                st.error(f"发现 **{len(bad_ids)}** 个样本的多边形角点贴近图像边界")
+                st.error(f"发现 **{len(bad_ids)}** 个样本包含不合格多边形")
+                st.markdown("##### 统计详情")
+                col_s1, col_s2, col_s3 = st.columns(3)
+                col_s1.metric("检查标注数", result["total_checked"])
+                col_s2.metric("非四角多边形", result["not_quad"])
+                col_s3.metric("几何形状异常", result["bad_geometry"])
+                if result["reasons"]:
+                    st.markdown("**异常原因分布：**")
+                    for reason, cnt in sorted(result["reasons"].items(), key=lambda x: -x[1]):
+                        st.text(f"  • {reason}: {cnt}")
             else:
-                st.success("未发现边界多边形")
+                st.success("所有托盘多边形均合格 ✓")
 
 
 def _render_cleaning(ds):
@@ -386,3 +452,170 @@ def _render_field_merge(ds):
                 st.rerun()
             except Exception as e:
                 st.error(f"合并失败: {e}")
+
+
+def _render_field_management(ds):
+    import fiftyone as fo
+
+    st.subheader("字段管理")
+
+    sub_add, sub_del = st.tabs(["➕ 添加字段", "⚠️ 删除字段"])
+
+    # ══════════════════════════ 添加字段 ══════════════════════════
+    with sub_add:
+        st.caption("为数据集中的样本添加新的标签字段（空字段），后续可用于预标注或 CVAT 导入。")
+
+        info = _get_info(ds)
+        existing_fields = info.get("sample_fields", [])
+
+        field_name = st.text_input(
+            "新字段名称",
+            placeholder="例如: predict, ground_truth_v2",
+            key="add_field_name",
+        )
+
+        _FIELD_TYPES = {
+            "Detections (目标检测框)": fo.Detections,
+            "Polylines (多边形/折线)": fo.Polylines,
+            "Keypoints (关键点)": fo.Keypoints,
+            "Classifications (分类标签)": fo.Classifications,
+        }
+        field_type_label = st.selectbox(
+            "字段类型", list(_FIELD_TYPES.keys()), key="add_field_type",
+        )
+        field_type_cls = _FIELD_TYPES[field_type_label]
+
+        scope = st.radio(
+            "操作范围", ["整个数据集", "按标签筛选"], key="add_field_scope", horizontal=True,
+        )
+        view = ds
+        if scope == "按标签筛选":
+            avail_tags = info.get("tags", [])
+            if avail_tags:
+                sel_tags = st.multiselect("选择标签", avail_tags, key="add_field_tags")
+                if sel_tags:
+                    view = ds.match_tags(sel_tags)
+            else:
+                st.info("当前数据集没有任何标签")
+        st.caption(f"操作范围: **{len(view)}** 个样本")
+
+        name_ok = True
+        if field_name:
+            if field_name in existing_fields:
+                st.warning(f"字段 `{field_name}` 已存在，执行后会跳过已有该字段值的样本")
+            if not field_name.isidentifier():
+                st.error("字段名称必须是合法的标识符（字母/下划线开头，仅含字母、数字、下划线）")
+                name_ok = False
+
+        can_run = bool(field_name) and name_ok and len(view) > 0
+
+        if st.button("➕ 添加字段", key="btn_add_field", disabled=not can_run):
+            added = 0
+            skipped = 0
+            progress = st.progress(0, text="添加中...")
+            total = len(view)
+            for i, sample in enumerate(view.iter_samples()):
+                if sample.has_field(field_name) and sample[field_name] is not None:
+                    skipped += 1
+                else:
+                    sample[field_name] = field_type_cls()
+                    sample.save()
+                    added += 1
+                if (i + 1) % 100 == 0 or i + 1 == total:
+                    progress.progress((i + 1) / total, text=f"{i + 1}/{total}")
+            progress.empty()
+            st.session_state["_toast_msg"] = (
+                f"字段 `{field_name}` 添加完成：{added} 个样本已添加"
+                + (f"，{skipped} 个已有字段被跳过" if skipped else "")
+            )
+            st.rerun()
+
+    # ══════════════════════════ 删除字段 ══════════════════════════
+    with sub_del:
+        st.caption("从数据集中删除一个字段。可选择仅清空筛选范围内样本的字段值，或从整个数据集永久删除。")
+
+        schema = ds.get_field_schema()
+        protected = {"id", "filepath", "tags", "metadata"}
+        deletable_fields = [fn for fn in schema if not fn.startswith("_") and fn not in protected]
+
+        if not deletable_fields:
+            st.info("当前数据集没有可删除的字段")
+            return
+
+        field_to_del = st.selectbox(
+            "选择字段", deletable_fields, key="del_field_select",
+        )
+
+        field_type = dm.get_field_label_type(ds, field_to_del)
+        if field_type:
+            field_stats = dm.get_label_stats(ds, field_to_del)
+            total_instances = sum(field_stats.values()) if field_stats else 0
+            st.info(f"字段类型: **{field_type}**，包含 **{len(field_stats)}** 个类别共 **{total_instances}** 个标注实例")
+        else:
+            st.info(f"字段 `{field_to_del}` 是非标签类型字段")
+
+        del_mode = st.radio(
+            "删除模式",
+            ["从整个数据集永久删除字段", "仅清空筛选范围内的字段值"],
+            key="del_field_mode",
+            horizontal=True,
+        )
+
+        info_del = _get_info(ds)
+
+        if del_mode == "仅清空筛选范围内的字段值":
+            del_scope = st.radio(
+                "筛选范围", ["整个数据集", "按标签筛选"],
+                key="del_field_scope", horizontal=True,
+            )
+            del_view = ds
+            if del_scope == "按标签筛选":
+                avail = info_del.get("tags", [])
+                if avail:
+                    del_tags = st.multiselect("选择标签", avail, key="del_field_tags")
+                    if del_tags:
+                        del_view = ds.match_tags(del_tags)
+                else:
+                    st.info("当前数据集没有任何标签")
+            st.caption(f"将清空 **{len(del_view)}** 个样本的 `{field_to_del}` 字段值")
+
+            confirm_clear = st.checkbox(
+                f"⚠️ 确认清空 {len(del_view)} 个样本的 `{field_to_del}` 字段",
+                key="confirm_clear_field",
+            )
+            if st.button(
+                "🧹 清空字段值", key="btn_clear_field",
+                disabled=not confirm_clear,
+            ):
+                cleared = 0
+                progress = st.progress(0, text="清空中...")
+                total = len(del_view)
+                for i, sample in enumerate(del_view.iter_samples()):
+                    if sample.has_field(field_to_del) and sample[field_to_del] is not None:
+                        sample[field_to_del] = None
+                        sample.save()
+                        cleared += 1
+                    if (i + 1) % 200 == 0 or i + 1 == total:
+                        progress.progress((i + 1) / total, text=f"{i + 1}/{total}")
+                progress.empty()
+                st.session_state["_toast_msg"] = f"已清空 {cleared} 个样本的 `{field_to_del}` 字段值"
+                st.rerun()
+
+        else:
+            st.error("此操作不可撤销！删除后该字段的所有数据将永久丢失。")
+            confirm_text = st.text_input(
+                f"输入字段名 `{field_to_del}` 以确认删除",
+                key="confirm_del_field_text",
+            )
+            if st.button(
+                f"⚠️ 永久删除字段 {field_to_del}",
+                key="btn_del_field",
+                disabled=(confirm_text != field_to_del),
+            ):
+                with st.spinner(f"正在删除字段 `{field_to_del}`..."):
+                    try:
+                        dm.delete_sample_field(ds, field_to_del)
+                        st.session_state["_toast_msg"] = f"已删除字段 '{field_to_del}'"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"删除失败: {e}")

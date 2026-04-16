@@ -94,16 +94,7 @@ def _render_hub_statistics(ds, info: dict):
 
     available_tags = info["tags"]
     if available_tags:
-        raw_counts = ds.count_values("tags")
-        raw_counts.pop(None, None)
-        num_samples = info["num_samples"]
-
-        has_anomaly = any(v > num_samples for v in raw_counts.values())
-        if has_anomaly:
-            tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
-        else:
-            tag_counts = raw_counts
-
+        tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
         if tag_counts:
             df_tags = pd.DataFrame(
                 list(tag_counts.items()), columns=["标签", "样本数"]
@@ -117,11 +108,6 @@ def _render_hub_statistics(ds, info: dict):
                 st.caption(
                     f"共 **{len(tag_counts)}** 种标签，"
                     f"一个样本可拥有多个标签"
-                )
-            if has_anomaly:
-                st.warning(
-                    "⚠️ 检测到数据库中存在**重复 Tags**（同一样本内相同标签出现多次），"
-                    "请点击下方『修复重复 Tags』清理。上方统计已自动修正显示。"
                 )
     else:
         st.info("当前数据集没有任何样本 Tags")
@@ -388,8 +374,8 @@ def _render_label_management(ds):
         st.info("当前数据集没有标签字段，请先导入标注数据")
         return
 
-    op_tab_rename, op_tab_del_label, op_tab_del_field = st.tabs([
-        "✏️ 类别重命名", "🗑️ 批量删除标注", "⚠️ 删除字段",
+    op_tab_rename, op_tab_del_label = st.tabs([
+        "✏️ 类别重命名", "🗑️ 批量删除标注",
     ])
 
     # ── 类别重命名 ──
@@ -463,51 +449,6 @@ def _render_label_management(ds):
                             st.error(f"删除失败: {e}")
         else:
             st.info(f"字段 `{del_field}` 中暂无标签类别")
-
-    # ── 删除字段 ──
-    with op_tab_del_field:
-        st.subheader("删除整个标签字段")
-        st.caption("从数据集中永久删除一个标签字段及其所有标注数据")
-
-        schema = ds.get_field_schema()
-        deletable_fields = []
-        for fn, field in schema.items():
-            if fn.startswith("_") or fn in ("id", "filepath", "tags", "metadata"):
-                continue
-            deletable_fields.append(fn)
-
-        if deletable_fields:
-            field_to_del = st.selectbox(
-                "选择要删除的字段", deletable_fields, key="del_field_select",
-            )
-
-            field_type = dm.get_field_label_type(ds, field_to_del)
-            if field_type:
-                field_stats = dm.get_label_stats(ds, field_to_del)
-                total_instances = sum(field_stats.values()) if field_stats else 0
-                st.info(f"字段类型: **{field_type}**，包含 **{len(field_stats)}** 个类别共 **{total_instances}** 个标注实例")
-            else:
-                st.info(f"字段 `{field_to_del}` 是非标签类型字段")
-
-            st.error("此操作不可撤销！删除后该字段的所有数据将永久丢失。")
-            confirm_text = st.text_input(
-                f"输入字段名 `{field_to_del}` 以确认删除",
-                key="confirm_del_field_text",
-            )
-            if st.button(
-                f"⚠️ 永久删除字段 {field_to_del}",
-                key="btn_del_field",
-                disabled=(confirm_text != field_to_del),
-            ):
-                with st.spinner(f"正在删除字段 `{field_to_del}`..."):
-                    try:
-                        dm.delete_sample_field(ds, field_to_del)
-                        st.session_state["_toast_msg"] = f"已删除字段 '{field_to_del}'"
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"删除失败: {e}")
-        else:
-            st.info("当前数据集没有可删除的字段")
 
     # ── 标注统计 ──
     st.markdown("---")
