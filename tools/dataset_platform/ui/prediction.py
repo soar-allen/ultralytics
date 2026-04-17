@@ -159,14 +159,16 @@ def _render_auto_predict_page():
 
     mode = st.radio(
         "**预标注模式**",
-        ["🦴 YOLO Pose → 四角多边形", "🎯 SAM3 辅助标注"],
+        ["🦴 YOLO Pose → 四角多边形", "🎯 SAM3 辅助标注", "🏷️ SAM3 标注标签"],
         key="pred_mode", horizontal=True,
     )
 
     if mode.startswith("🦴"):
         _render_pose_mode(ds, info, unlabeled)
-    else:
+    elif mode.startswith("🎯"):
         _render_sam3_mode(ds, info, unlabeled)
+    else:
+        _render_sam3_tag_mode(ds, info, unlabeled)
 
 
 # -----------------------------------------------------------------------
@@ -290,6 +292,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
     text_prompts = None
     box_source_field = None
     box_source_labels = None
+    box_source_tags: list[str] = []
     box_expand_ratio = 0.5
     box_mask_strategy = "smallest_covering"
 
@@ -309,7 +312,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         text_prompts = [line.strip() for line in text_input.strip().split("\n") if line.strip()]
         if text_prompts:
             st.caption(f"文本提示词: {text_prompts}")
-        box_source_field, box_source_labels = _render_box_source_selector(ds)
+        box_source_field, box_source_labels, box_source_tags = _render_box_source_selector(ds)
         box_expand_ratio = st.slider(
             "范例 BBox 扩展比例", 0.0, 2.0, 0.5, 0.1, key="sam3_box_expand",
             help="扩展已有标注的 bbox，使 SAM3 能看到更大的上下文。",
@@ -338,7 +341,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
             "SAM3 会理解『这个框里的东西长什么样』，然后找出图像中**所有相似实例**。\n"
             "适合：已有局部标注（如托盘前表面），需要找到完整目标。"
         )
-        box_source_field, box_source_labels = _render_box_source_selector(ds)
+        box_source_field, box_source_labels, box_source_tags = _render_box_source_selector(ds)
         box_expand_ratio = st.slider(
             "范例 BBox 扩展比例", 0.0, 2.0, 0.5, 0.1, key="sam3_box_expand",
             help="扩展已有标注的 bbox，使 SAM3 能看到更大的上下文。\n"
@@ -352,7 +355,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
             "在扩展的 bbox 区域内进行分割。输出与来源标注 1:1 对应。\n"
             "适合：需要精确的逐标注分割。"
         )
-        box_source_field, box_source_labels = _render_box_source_selector(ds)
+        box_source_field, box_source_labels, box_source_tags = _render_box_source_selector(ds)
 
         col_expand, col_strategy = st.columns(2)
         with col_expand:
@@ -431,6 +434,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
                 text_prompts=text_prompts,
                 box_source_field=box_source_field,
                 box_source_labels=box_source_labels,
+                box_source_tags=box_source_tags,
                 box_expand_ratio=box_expand_ratio,
                 box_mask_strategy=box_mask_strategy,
                 label_name=label_name,
@@ -444,12 +448,174 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         _show_predict_stats(stats)
 
 
-def _render_box_source_selector(ds) -> tuple:
-    """渲染来源字段和类别多选器，返回 (field, labels_list | None)。
+# -----------------------------------------------------------------------
+# SAM3 标注标签
+# -----------------------------------------------------------------------
 
-    labels_list 为 None 时表示不过滤（取全部类别）。
+def _render_sam3_tag_mode(ds, info: dict, unlabeled):
+    """SAM3 标注标签：仅识别是否存在目标并为图片打标签，不生成标注。"""
+    st.markdown("### 🏷️ SAM3 标注标签")
+    st.caption(
+        "使用 SAM3 识别图片中是否存在你指定的目标，**不生成标注**，仅为图片打上相应标签。\n"
+        "适合场景：快速分类筛选、给数据集分批、标记含特定目标的样本。"
+    )
+
+    col_model, col_tag = st.columns(2)
+
+    with col_model:
+        st.subheader("模型配置")
+        model_path = _model_selector("SAM3 权重", "sam3_tag_model")
+        half = st.checkbox("FP16 半精度加速", value=True, key="sam3_tag_half")
+        conf = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05, key="sam3_tag_conf")
+
+    with col_tag:
+        st.subheader("标签配置")
+        found_tag = st.text_input(
+            "识别成功标签", value="sam3_found", key="sam3_tag_found",
+            help="SAM3 检测到目标时为图片打上此标签",
+        )
+        not_found_tag = st.text_input(
+            "未识别标签（可选）", value="", key="sam3_tag_not_found",
+            help="SAM3 未检测到目标时打上此标签。留空则不打",
+        )
+        fail_tag = st.text_input(
+            "预测失败标签", value="sam3_tag_failed", key="sam3_tag_fail",
+            help="SAM3 预测出错时打上此标签。留空则不打",
+        )
+
+    st.markdown("---")
+    st.subheader("提示策略")
+
+    tag_prompt_choice = st.radio(
+        "选择提示策略",
+        [
+            "🔗 联合提示 (文本+范例) — 推荐",
+            "📝 文本概念 (Text Prompt)",
+            "📦 图像范例 (Box Example)",
+        ],
+        key="sam3_tag_prompt_mode", horizontal=True,
+    )
+
+    text_prompts = None
+    box_source_field = None
+    box_source_labels = None
+    box_source_tags: list[str] = []
+    box_expand_ratio = 0.5
+
+    if tag_prompt_choice.startswith("🔗"):
+        st.info("同时使用文字描述和已有标注范例作为提示，当无范例时退化为纯文本提示。")
+        text_input = st.text_area(
+            "文本提示 (每行一个提示词)", value="pallet",
+            key="sam3_tag_text_combined",
+        )
+        text_prompts = [line.strip() for line in text_input.strip().split("\n") if line.strip()]
+        box_source_field, box_source_labels, box_source_tags = _render_box_source_selector(
+            ds, key_prefix="sam3_tag_box",
+        )
+        box_expand_ratio = st.slider(
+            "范例 BBox 扩展比例", 0.0, 2.0, 0.5, 0.1, key="sam3_tag_expand",
+        )
+
+    elif tag_prompt_choice.startswith("📝"):
+        st.info("仅使用文字描述来检测目标是否存在。")
+        text_input = st.text_area(
+            "文本提示 (每行一个提示词)", value="pallet",
+            key="sam3_tag_text",
+        )
+        text_prompts = [line.strip() for line in text_input.strip().split("\n") if line.strip()]
+
+    else:
+        st.info("使用已有标注作为视觉范例来检测目标。")
+        box_source_field, box_source_labels, box_source_tags = _render_box_source_selector(
+            ds, key_prefix="sam3_tag_box",
+        )
+        box_expand_ratio = st.slider(
+            "范例 BBox 扩展比例", 0.0, 2.0, 0.5, 0.1, key="sam3_tag_expand",
+        )
+
+    st.markdown("---")
+    st.subheader("识别范围")
+
+    tag_scope = st.radio(
+        "选择范围", ["整个数据集", "按 Tags 筛选"],
+        key="sam3_tag_scope", horizontal=True,
+    )
+    tag_view = None
+    if tag_scope == "按 Tags 筛选":
+        available_tags = ds.distinct("tags")
+        if available_tags:
+            sel_tags = st.multiselect("选择 Tags", available_tags, key="sam3_tag_filter_tags")
+            if sel_tags:
+                tag_view = ds.match_tags(sel_tags)
+                st.info(f"将对 **{len(tag_view)}** 个匹配样本进行识别")
+        else:
+            st.info("当前数据集没有 Tags")
+    else:
+        st.info(f"将对整个数据集的 **{len(ds)}** 个样本进行识别")
+
+    st.markdown("---")
+    if st.button("🚀 开始 SAM3 标签识别", key="btn_sam3_tag_start", type="primary"):
+        if not model_path or not Path(model_path).exists():
+            st.error("请选择有效的模型权重文件")
+            return
+        if not text_prompts and not box_source_field:
+            st.error("请至少提供文本提示或来源字段之一")
+            return
+
+        target = tag_view if tag_view is not None else None
+        target_count = len(target) if target is not None else len(ds)
+        with st.spinner(f"使用 SAM3 对 {target_count} 个样本进行目标识别..."):
+            stats = processor.auto_tag_sam3(
+                ds, model_path,
+                text_prompts=text_prompts,
+                box_source_field=box_source_field,
+                box_source_labels=box_source_labels,
+                box_source_tags=box_source_tags,
+                box_expand_ratio=box_expand_ratio,
+                conf_threshold=conf,
+                found_tag=found_tag.strip(),
+                not_found_tag=not_found_tag.strip(),
+                fail_tag=fail_tag.strip(),
+                view=target,
+                half=half,
+            )
+        st.success("SAM3 标签识别完成")
+
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+        col_s1.metric("处理图像", stats.get("images_processed", 0))
+        col_s2.metric("识别到目标", stats.get("found", 0))
+        col_s3.metric("未识别到", stats.get("not_found", 0))
+        col_s4.metric("失败/报错", stats.get("errors", 0))
+
+        with st.expander("详细统计 JSON"):
+            st.json(stats)
+
+    # 清除标签区域
+    st.markdown("---")
+    _render_clear_tag_section(ds)
+
+
+def _render_box_source_selector(ds, key_prefix: str = "sam3") -> tuple:
+    """渲染来源标签、来源字段和来源类别多选器。
+
+    Returns:
+        (box_source_field, box_source_labels, box_source_tags)
+        - box_source_labels: None 表示不过滤（取全部类别）
+        - box_source_tags: 选中的标签列表，空列表表示不按标签过滤
     """
     import fiftyone as fo
+
+    # 来源标签（按 tags 筛选哪些样本的标注作为范例来源）
+    available_tags = ds.distinct("tags")
+    box_source_tags: list[str] = []
+    if available_tags:
+        box_source_tags = st.multiselect(
+            "来源标签（筛选哪些样本的标注作为范例，不选则不过滤）",
+            available_tags,
+            key=f"{key_prefix}_box_tags",
+            help="可多选。仅使用带有所选标签的样本中的标注作为视觉范例来源。留空则使用所有样本。",
+        )
+
     schema = ds.get_field_schema()
     source_fields = []
     for fn, field in schema.items():
@@ -466,14 +632,14 @@ def _render_box_source_selector(ds) -> tuple:
     if source_fields:
         box_source_field = st.selectbox(
             "来源字段（包含已有 Polyline/Detection）", source_fields,
-            key="sam3_box_field",
+            key=f"{key_prefix}_box_field",
         )
         classes = dm.get_label_classes(ds, box_source_field) if box_source_field else []
         if classes:
             selected = st.multiselect(
                 "来源类别（选择用作范例的类别，不选则使用全部类别）",
                 classes,
-                key="sam3_box_label",
+                key=f"{key_prefix}_box_label",
                 help="可多选。为空时取字段内所有类别的标注作为视觉范例。",
             )
             box_source_labels = selected if selected else None
@@ -482,7 +648,7 @@ def _render_box_source_selector(ds) -> tuple:
     else:
         st.warning("当前数据集无可用的 Polyline/Detection 字段，请先添加标注或使用文本概念模式")
 
-    return box_source_field, box_source_labels
+    return box_source_field, box_source_labels, box_source_tags
 
 
 # -----------------------------------------------------------------------
