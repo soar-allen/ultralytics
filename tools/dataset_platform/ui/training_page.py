@@ -102,10 +102,20 @@ def _render_train_config(ds):
             key="train_task",
         )
 
-        project_dir = st.text_input(
-            "训练输出目录 (project)", value="runs", key="train_project",
-            help="训练产出（权重、日志、可视化）将保存在此目录下",
+        _DEFAULT_PROJECT = "runs/pose"
+        project_source = st.radio(
+            "训练输出目录", ["默认路径", "自定义路径"],
+            key="train_project_source", horizontal=True,
         )
+        if project_source == "默认路径":
+            project_dir = st.text_input(
+                "输出目录 (project)", value=_DEFAULT_PROJECT, key="train_project",
+                help=f"默认: `{_DEFAULT_PROJECT}`，训练产出保存在此目录下",
+            )
+        else:
+            project_dir = _path_browser(
+                "输出目录 (project)", "train_project_custom", mode="directory",
+            )
 
     # ── 数据配置（右侧） ──
     with col_data:
