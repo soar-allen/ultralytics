@@ -169,6 +169,38 @@ OCCLUSION_ATTRS = {
 }
 
 
+_ANNO_TYPE_META_KEY = "_anno_type_meta"
+
+_TYPE_TAG_PREFIX = {
+    "detections": "bbox",
+    "polylines": "job",
+    "keypoints": "job",
+    "classifications": "job",
+}
+
+
+def _save_anno_type(ds: fo.Dataset, anno_key: str, label_types: list[str]) -> None:
+    """将 anno_key 对应的标注类型列表持久化到 ds.info 中。"""
+    meta = ds.info.get(_ANNO_TYPE_META_KEY, {})
+    meta[anno_key] = label_types
+    ds.info[_ANNO_TYPE_META_KEY] = meta
+    ds.save()
+
+
+def _get_anno_type(ds: fo.Dataset, anno_key: str) -> list[str]:
+    """读取 anno_key 对应的标注类型列表，无记录则返回空列表。"""
+    return ds.info.get(_ANNO_TYPE_META_KEY, {}).get(anno_key, [])
+
+
+def _tag_prefix_for_types(label_types: list[str]) -> str:
+    """根据标注类型列表决定 tag 前缀。detections→bbox，其余→job。"""
+    for lt in label_types:
+        prefix = _TYPE_TAG_PREFIX.get(lt)
+        if prefix:
+            return prefix
+    return "job"
+
+
 def push_to_cvat(
     samples: fo.Dataset | fo.DatasetView,
     anno_key: str,
@@ -303,11 +335,32 @@ def push_to_cvat(
             ) from e
         raise
 
+    # 推送成功后，持久化标注类型元数据用于拉取时区分 tag 前缀
+    detected_types: list[str] = []
+    if label_schema:
+        from .data_manager import get_field_label_type
+        for f_name in pushed_fields:
+            entry = label_schema.get(f_name, {})
+            etype = entry.get("type") or get_field_label_type(ds, f_name)
+            if etype:
+                detected_types.append(etype)
+    elif label_type:
+        detected_types.append(label_type)
+    else:
+        from .data_manager import get_field_label_type
+        etype = get_field_label_type(ds, pushed_fields[0]) if pushed_fields else None
+        if etype:
+            detected_types.append(etype)
+    if detected_types:
+        _save_anno_type(ds, anno_key, detected_types)
+        logger.info("已记录 anno_key=%s 的标注类型: %s", anno_key, detected_types)
+
     info = {
         "anno_key": anno_key,
         "project_name": project_name,
         "task_name": task_name,
         "label_fields": pushed_fields,
+        "label_types": detected_types,
         "num_samples": len(samples),
     }
     logger.info("推送成功: %s", info)
@@ -542,6 +595,14 @@ def delete_annotation_run(ds: fo.Dataset, anno_key: str, cleanup: bool = False) 
             logger.warning("CVAT 清理失败 (anno_key=%s): %s", anno_key, e)
 
     ds.delete_annotation_run(anno_key)
+
+    # 清理持久化的标注类型元数据
+    meta = ds.info.get(_ANNO_TYPE_META_KEY, {})
+    if anno_key in meta:
+        del meta[anno_key]
+        ds.info[_ANNO_TYPE_META_KEY] = meta
+        ds.save()
+
     logger.info("已删除标注运行: %s", anno_key)
 
 
@@ -676,21 +737,34 @@ def get_job_details(ds: fo.Dataset, anno_key: str) -> list[dict]:
 def tag_samples_by_job_status(
     ds: fo.Dataset,
     anno_keys: str | list[str],
-    tag_prefix: str = "job",
+    tag_prefix: str | None = None,
 ) -> dict[str, int]:
     """根据 CVAT Job 状态为 FiftyOne 样本打标签。
 
     每次调用会 **先清除** 所有相关样本上已有的 ``{prefix}_*`` 旧标签，
     再按最新 Job 状态重新打标，因此可安全反复调用以同步最新状态。
 
-    支持传入单个或多个 anno_key，覆盖多字段推送的全部 Task。
+    tag_prefix 为 None 时自动根据推送时记录的标注类型选择前缀：
+      - detections → ``bbox_``
+      - polylines / keypoints / 其它 → ``job_``
     """
     if isinstance(anno_keys, str):
         anno_keys = [anno_keys]
 
+    # 按 anno_key 分组收集 jobs，每组独立确定前缀
+    key_prefix_map: dict[str, str] = {}
     all_jobs: list[dict] = []
     for key in anno_keys:
-        all_jobs.extend(get_job_details(ds, key))
+        if tag_prefix is not None:
+            pfx = tag_prefix
+        else:
+            label_types = _get_anno_type(ds, key)
+            pfx = _tag_prefix_for_types(label_types)
+        key_prefix_map[key] = pfx
+        jobs = get_job_details(ds, key)
+        for j in jobs:
+            j["_tag_prefix"] = pfx
+        all_jobs.extend(jobs)
 
     all_sids: list[str] = []
     for job in all_jobs:
@@ -699,21 +773,23 @@ def tag_samples_by_job_status(
     if not all_sids:
         return {}
 
-    # 清除旧的 job 状态标签
+    # 清除旧的 job/bbox 状态标签
     all_view = ds.select(all_sids)
     existing_tags = all_view.distinct("tags")
+    prefixes_to_clean = set(key_prefix_map.values())
     for old_tag in existing_tags:
-        if old_tag.startswith(f"{tag_prefix}_"):
+        if any(old_tag.startswith(f"{p}_") for p in prefixes_to_clean):
             all_view.untag_samples(old_tag)
 
-    # 按最新 Job 状态打标签
+    # 按最新 Job 状态打标签（每个 job 使用其对应的前缀）
     tagged: dict[str, int] = {}
     for job in all_jobs:
         sids = job["sample_ids"]
         if not sids:
             continue
-        state_tag = f"{tag_prefix}_{job['state'].replace(' ', '_')}"
-        stage_tag = f"{tag_prefix}_{job['stage'].replace(' ', '_')}"
+        pfx = job["_tag_prefix"]
+        state_tag = f"{pfx}_{job['state'].replace(' ', '_')}"
+        stage_tag = f"{pfx}_{job['stage'].replace(' ', '_')}"
         view = ds.select(sids)
         for tag in (state_tag, stage_tag):
             view.tag_samples(tag)

@@ -300,6 +300,13 @@ def _render_cvat_pull(ds):
                 st.caption(f"配置: {run_info.config if hasattr(run_info, 'config') else 'N/A'}")
         except Exception:
             pass
+
+        anno_types = cvat_sync._get_anno_type(ds, anno_key)
+        if anno_types:
+            _TYPE_LABELS = {"detections": "矩形框", "polylines": "多边形", "keypoints": "关键点", "classifications": "分类"}
+            type_display = ", ".join(_TYPE_LABELS.get(t, t) for t in anno_types)
+            prefix = cvat_sync._tag_prefix_for_types(anno_types)
+            st.info(f"📋 任务标注类型: **{type_display}** — 拉取后完成的 Job 将标记为 `{prefix}_completed`")
     else:
         st.warning("当前数据集没有标注运行记录。")
         anno_key = ""

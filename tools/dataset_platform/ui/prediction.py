@@ -275,23 +275,47 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
     prompt_choice = st.radio(
         "选择提示策略",
         [
+            "🔗 联合提示 (文本+范例) — 推荐",
             "📝 文本概念 (Text Prompt)",
-            "📦 图像范例 (Box Example) — 推荐",
+            "📦 图像范例 (Box Example)",
             "🔍 视觉分割 (Box Visual, SAM2 兼容)",
         ],
         key="sam3_prompt_mode",
-        help="文本概念：用文字描述要找的目标\n"
-             "图像范例：用已有标注作为示例，SAM3 自动找出所有相似目标\n"
-             "视觉分割：SAM2 兼容模式，对每个标注逐一做区域内分割",
+        help="联合提示：同时用文字描述和已有标注范例，准确率最高\n"
+             "文本概念：仅用文字描述目标\n"
+             "图像范例：仅用已有标注作为视觉范例\n"
+             "视觉分割：SAM2 兼容模式，对每个标注逐一分割",
     )
 
     text_prompts = None
     box_source_field = None
-    box_source_label = None
+    box_source_labels = None
     box_expand_ratio = 0.5
     box_mask_strategy = "smallest_covering"
 
-    if prompt_choice.startswith("📝"):
+    if prompt_choice.startswith("🔗"):
+        p_mode = "combined"
+        st.info(
+            "**联合提示 (推荐)**：同时向 SAM3SemanticPredictor 传入文字描述和已有标注范例，\n"
+            "SAM3 将文字概念与视觉范例结合理解目标，识别准确率高于单独使用任一方式。\n"
+            "当某张图没有范例时，自动退化为纯文本提示。"
+        )
+        text_input = st.text_area(
+            "文本提示 (每行一个提示词)",
+            value="pallet",
+            key="sam3_text",
+            help="目标的文字描述，如 'pallet', 'wooden pallet' 等",
+        )
+        text_prompts = [line.strip() for line in text_input.strip().split("\n") if line.strip()]
+        if text_prompts:
+            st.caption(f"文本提示词: {text_prompts}")
+        box_source_field, box_source_labels = _render_box_source_selector(ds)
+        box_expand_ratio = st.slider(
+            "范例 BBox 扩展比例", 0.0, 2.0, 0.5, 0.1, key="sam3_box_expand",
+            help="扩展已有标注的 bbox，使 SAM3 能看到更大的上下文。",
+        )
+
+    elif prompt_choice.startswith("📝"):
         p_mode = "text"
         st.info(
             "**文本概念分割**：使用 SAM3SemanticPredictor 查找图像中所有匹配文字描述的目标。\n"
@@ -310,11 +334,11 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
     elif prompt_choice.startswith("📦"):
         p_mode = "box_example"
         st.info(
-            "**图像范例匹配** (推荐)：将已有标注的 bbox 作为视觉范例传入 SAM3SemanticPredictor，\n"
+            "**图像范例匹配**：将已有标注的 bbox 作为视觉范例传入 SAM3SemanticPredictor，\n"
             "SAM3 会理解『这个框里的东西长什么样』，然后找出图像中**所有相似实例**。\n"
             "适合：已有局部标注（如托盘前表面），需要找到完整目标。"
         )
-        box_source_field, box_source_label = _render_box_source_selector(ds)
+        box_source_field, box_source_labels = _render_box_source_selector(ds)
         box_expand_ratio = st.slider(
             "范例 BBox 扩展比例", 0.0, 2.0, 0.5, 0.1, key="sam3_box_expand",
             help="扩展已有标注的 bbox，使 SAM3 能看到更大的上下文。\n"
@@ -328,7 +352,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
             "在扩展的 bbox 区域内进行分割。输出与来源标注 1:1 对应。\n"
             "适合：需要精确的逐标注分割。"
         )
-        box_source_field, box_source_label = _render_box_source_selector(ds)
+        box_source_field, box_source_labels = _render_box_source_selector(ds)
 
         col_expand, col_strategy = st.columns(2)
         with col_expand:
@@ -382,6 +406,9 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         if p_mode == "text" and not text_prompts:
             st.error("请输入至少一个文本提示")
             return
+        if p_mode == "combined" and not text_prompts and not box_source_field:
+            st.error("联合提示模式需要至少提供文本提示或来源字段之一")
+            return
         if p_mode in ("box_example", "box_visual") and not box_source_field:
             st.error("请选择来源字段")
             return
@@ -390,7 +417,10 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         target = pred_view if pred_view is not None else None
         target_count = len(target) if target is not None else len(ds)
 
-        strategy_names = {"text": "文本概念", "box_example": "图像范例", "box_visual": "视觉分割"}
+        strategy_names = {
+            "text": "文本概念", "box_example": "图像范例",
+            "combined": "联合提示", "box_visual": "视觉分割",
+        }
         with st.spinner(f"使用 SAM3 ({strategy_names[p_mode]} → {o_mode}) 对 {target_count} 个样本标注..."):
             stats = processor.auto_predict_sam3(
                 ds, model_path,
@@ -400,7 +430,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
                 prompt_mode=p_mode,
                 text_prompts=text_prompts,
                 box_source_field=box_source_field,
-                box_source_label=box_source_label,
+                box_source_labels=box_source_labels,
                 box_expand_ratio=box_expand_ratio,
                 box_mask_strategy=box_mask_strategy,
                 label_name=label_name,
@@ -415,7 +445,10 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
 
 
 def _render_box_source_selector(ds) -> tuple:
-    """渲染来源字段和类别选择器，返回 (field, label)。"""
+    """渲染来源字段和类别多选器，返回 (field, labels_list | None)。
+
+    labels_list 为 None 时表示不过滤（取全部类别）。
+    """
     import fiftyone as fo
     schema = ds.get_field_schema()
     source_fields = []
@@ -428,7 +461,7 @@ def _render_box_source_selector(ds) -> tuple:
             source_fields.append(fn)
 
     box_source_field = None
-    box_source_label = None
+    box_source_labels = None
 
     if source_fields:
         box_source_field = st.selectbox(
@@ -437,19 +470,19 @@ def _render_box_source_selector(ds) -> tuple:
         )
         classes = dm.get_label_classes(ds, box_source_field) if box_source_field else []
         if classes:
-            box_source_label = st.selectbox(
-                "来源类别（仅取此类别的标注作为范例）",
-                ["（全部类别）"] + classes,
+            selected = st.multiselect(
+                "来源类别（选择用作范例的类别，不选则使用全部类别）",
+                classes,
                 key="sam3_box_label",
+                help="可多选。为空时取字段内所有类别的标注作为视觉范例。",
             )
-            if box_source_label == "（全部类别）":
-                box_source_label = None
+            box_source_labels = selected if selected else None
         else:
             st.info("该字段中暂无标注类别")
     else:
         st.warning("当前数据集无可用的 Polyline/Detection 字段，请先添加标注或使用文本概念模式")
 
-    return box_source_field, box_source_label
+    return box_source_field, box_source_labels
 
 
 # -----------------------------------------------------------------------

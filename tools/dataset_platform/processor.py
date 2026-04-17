@@ -1148,7 +1148,7 @@ def auto_predict_sam3(
     prompt_mode: str = "text",
     text_prompts: Optional[list[str]] = None,
     box_source_field: Optional[str] = None,
-    box_source_label: Optional[str] = None,
+    box_source_labels: Optional[list[str]] = None,
     box_expand_ratio: float = 0.5,
     box_mask_strategy: str = "smallest_covering",
     label_name: str = "object",
@@ -1159,10 +1159,11 @@ def auto_predict_sam3(
     half: bool = True,
 ) -> dict:
     """
-    SAM3 辅助标注，三种提示策略：
+    SAM3 辅助标注，四种提示策略：
 
     - text:        SAM3SemanticPredictor + text prompt → 概念分割
     - box_example: SAM3SemanticPredictor + bboxes (图像范例) → 概念匹配
+    - combined:    SAM3SemanticPredictor + text + bboxes 联合提示 → 最强匹配
     - box_visual:  ultralytics.SAM + 扩展框 → SAM2 兼容视觉分割 (逐多边形)
     """
     target = view if view is not None else ds
@@ -1176,13 +1177,19 @@ def auto_predict_sam3(
     elif prompt_mode == "box_example":
         _sam3_box_example_predict(
             target, model_path, pred_field, conf_threshold, output_mode,
-            box_source_field, box_source_label, box_expand_ratio,
+            box_source_field, box_source_labels, box_expand_ratio,
+            label_name, skip_labeled, nms_iou, fail_tag, half, stats,
+        )
+    elif prompt_mode == "combined":
+        _sam3_combined_predict(
+            target, model_path, pred_field, conf_threshold, output_mode,
+            text_prompts, box_source_field, box_source_labels, box_expand_ratio,
             label_name, skip_labeled, nms_iou, fail_tag, half, stats,
         )
     elif prompt_mode == "box_visual":
         _sam_box_visual_predict(
             target, model_path, pred_field, conf_threshold, output_mode,
-            box_source_field, box_source_label, box_expand_ratio, box_mask_strategy,
+            box_source_field, box_source_labels, box_expand_ratio, box_mask_strategy,
             label_name, skip_labeled, nms_iou, fail_tag, stats,
         )
     else:
@@ -1239,18 +1246,23 @@ def _sam3_text_predict(
 # ── Box example prompt (概念匹配，推荐) ──────────────────────
 
 def _extract_source_bboxes_px(
-    sample, box_source_field: str, box_source_label: Optional[str],
+    sample, box_source_field: str, box_source_labels: Optional[list[str]],
     w_img: int, h_img: int,
 ) -> list[list[float]]:
-    """从样本的来源字段提取像素级 xyxy bboxes。"""
+    """从样本的来源字段提取像素级 xyxy bboxes，支持多类别过滤。
+
+    Args:
+        box_source_labels: 要匹配的类别列表；None 或空列表表示不过滤（全部取）。
+    """
     if not sample.has_field(box_source_field):
         return []
     source = sample[box_source_field]
     if source is None:
         return []
     items = getattr(source, "polylines", None) or getattr(source, "detections", None) or []
-    if box_source_label:
-        items = [it for it in items if getattr(it, "label", None) == box_source_label]
+    if box_source_labels:
+        label_set = set(box_source_labels)
+        items = [it for it in items if getattr(it, "label", None) in label_set]
 
     bboxes = []
     for it in items:
@@ -1281,14 +1293,14 @@ def _expand_bbox(bbox: list[float], ratio: float,
 
 def _sam3_box_example_predict(
     target, model_path, pred_field, conf_threshold, output_mode,
-    box_source_field, box_source_label, expand_ratio,
+    box_source_field, box_source_labels, expand_ratio,
     label_name, skip_labeled, nms_iou, fail_tag, half, stats,
 ):
     """Box example prompt：SAM3SemanticPredictor + bboxes 图像范例。
 
-    与 text prompt 使用同一个 predictor，区别在于用 bboxes= 而非 text=。
     SAM3 会把 bbox 内的内容当作"概念范例"，找出图像中所有相似实例。
     bbox 会按 expand_ratio 扩展，确保 SAM3 能看到超出来源多边形的完整目标。
+    支持多类别：box_source_labels 为 None/[] 时取字段内全部标注。
     """
     from ultralytics.models.sam import SAM3SemanticPredictor
 
@@ -1311,7 +1323,7 @@ def _sam3_box_example_predict(
         h_img, w_img = img.shape[:2]
 
         raw_bboxes = _extract_source_bboxes_px(
-            sample, box_source_field, box_source_label, w_img, h_img,
+            sample, box_source_field, box_source_labels, w_img, h_img,
         )
         if not raw_bboxes:
             stats["no_source_items"] += 1
@@ -1339,17 +1351,86 @@ def _sam3_box_example_predict(
     predictor.reset_prompts()
 
 
+# ── Combined prompt (text + box example) ─────────────────────
+
+def _sam3_combined_predict(
+    target, model_path, pred_field, conf_threshold, output_mode,
+    text_prompts, box_source_field, box_source_labels, expand_ratio,
+    label_name, skip_labeled, nms_iou, fail_tag, half, stats,
+):
+    """联合提示：SAM3SemanticPredictor 同时接收 text 和 bboxes。
+
+    SAM3 会将文字概念与图像范例结合理解目标，准确率高于单独使用任一方式。
+    - text_prompts: 文字描述列表（如 ['pallet', 'wooden pallet']）
+    - box_source_labels: 来源字段中作为视觉范例的类别列表（空=全部）
+    - expand_ratio: 范例 bbox 扩展比例
+    """
+    from ultralytics.models.sam import SAM3SemanticPredictor
+
+    overrides = dict(
+        conf=conf_threshold, task="segment", mode="predict",
+        model=model_path, half=half, save=False,
+    )
+    predictor = SAM3SemanticPredictor(overrides=overrides)
+
+    for sample in target.iter_samples(progress=True, autosave=True):
+        existing_items = _read_existing_items(sample, pred_field, output_mode)
+        if skip_labeled and existing_items:
+            stats["skipped_labeled"] += 1
+            continue
+
+        img = cv2.imread(sample.filepath)
+        if img is None:
+            stats["errors"] += 1
+            continue
+        h_img, w_img = img.shape[:2]
+
+        # 提取范例 bboxes（可为空，此时退化为纯文本提示）
+        raw_bboxes = _extract_source_bboxes_px(
+            sample, box_source_field, box_source_labels, w_img, h_img,
+        ) if box_source_field else []
+        expanded = [_expand_bbox(bb, expand_ratio, w_img, h_img) for bb in raw_bboxes]
+
+        if not text_prompts and not expanded:
+            stats["no_source_items"] += 1
+            continue
+
+        try:
+            predictor.set_image(sample.filepath)
+            kwargs: dict = {}
+            if text_prompts:
+                kwargs["text"] = text_prompts
+            if expanded:
+                kwargs["bboxes"] = expanded
+            results = predictor(**kwargs)
+        except Exception as e:
+            logger.warning("SAM3 combined 预测失败 (%s): %s", sample.filepath, e)
+            stats["errors"] += 1
+            _tag_fail(sample, fail_tag, stats)
+            continue
+
+        has_output = _process_sam_results(
+            results, sample, pred_field, existing_items, output_mode,
+            label_name, nms_iou, stats,
+        )
+        if not has_output:
+            _tag_fail(sample, fail_tag, stats)
+        stats["images_processed"] += 1
+
+    predictor.reset_prompts()
+
+
 # ── Box visual prompt (SAM2 兼容，逐多边形) ───────────────────
 
 def _sam_box_visual_predict(
     target, model_path, pred_field, conf_threshold, output_mode,
-    box_source_field, box_source_label, expand_ratio, mask_strategy,
+    box_source_field, box_source_labels, expand_ratio, mask_strategy,
     label_name, skip_labeled, nms_iou, fail_tag, stats,
 ):
     """Box visual prompt：ultralytics.SAM (SAM2 兼容) 逐多边形视觉分割。
 
-    与 box_example 不同，这里对每个来源多边形单独调用 SAM，
-    让模型分割扩展框内的特定目标，而不是查找所有相似实例。
+    对每个来源多边形单独调用 SAM，分割扩展框内的特定目标。
+    支持多类别：box_source_labels 为 None/[] 时取字段内全部标注。
     """
     from ultralytics import SAM
 
@@ -1370,8 +1451,9 @@ def _sam_box_visual_predict(
             continue
 
         items = getattr(source, "polylines", None) or getattr(source, "detections", None) or []
-        if box_source_label:
-            items = [it for it in items if getattr(it, "label", None) == box_source_label]
+        if box_source_labels:
+            label_set = set(box_source_labels)
+            items = [it for it in items if getattr(it, "label", None) in label_set]
         if not items:
             stats["no_source_items"] += 1
             continue

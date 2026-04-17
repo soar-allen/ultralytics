@@ -17,14 +17,12 @@ def _render_processing():
         st.info("请先选择数据集")
         return
 
-    tab_clean, tab_merge, tab_field_mgmt = st.tabs(
-        ["🧹 图像清理", "🔀 字段合并", "🗂️ 字段管理"],
+    tab_clean, tab_field_mgmt = st.tabs(
+        ["🧹 图像清理", "🗂️ 字段管理"],
     )
 
     with tab_clean:
         _render_cleaning(ds)
-    with tab_merge:
-        _render_field_merge(ds)
     with tab_field_mgmt:
         _render_field_management(ds)
 
@@ -394,72 +392,12 @@ def _render_cleaning(ds):
                 st.rerun()
 
 
-def _render_field_merge(ds):
-    st.subheader("标签字段合并")
-    st.caption(
-        "将一个标签字段的标注合并到另一个字段中。"
-        "适用于分批导入时使用了不同字段名（如 `batch2_gt`），"
-        "标注完成后需要汇总到统一字段（如 `ground_truth`）。"
-    )
-
-    info = _get_info(ds)
-    label_fields = info.get("label_fields", [])
-    all_fields = info.get("sample_fields", [])
-
-    if len(label_fields) < 2:
-        st.info("当前数据集只有 0~1 个标签字段，无需合并。需要至少 2 个标签字段才能进行合并操作。")
-        return
-
-    col1, col2 = st.columns(2)
-    with col1:
-        source_field = st.selectbox("源字段（将被合并）", label_fields, key="merge_src")
-        src_stats = dm.get_label_stats(ds, source_field)
-        if src_stats:
-            st.caption(f"包含 {sum(src_stats.values())} 个标注实例 ({len(src_stats)} 类别)")
-        else:
-            st.caption("该字段暂无标注数据")
-
-    with col2:
-        target_options = [f for f in label_fields if f != source_field]
-        target_field = st.selectbox("目标字段（合并到此）", target_options, key="merge_tgt")
-        tgt_stats = dm.get_label_stats(ds, target_field)
-        if tgt_stats:
-            st.caption(f"包含 {sum(tgt_stats.values())} 个标注实例 ({len(tgt_stats)} 类别)")
-        else:
-            st.caption("该字段暂无标注数据")
-
-    src_type = dm.get_field_label_type(ds, source_field)
-    tgt_type = dm.get_field_label_type(ds, target_field)
-    if src_type and tgt_type and src_type != tgt_type:
-        st.error(f"类型不匹配：源字段为 `{src_type}`，目标字段为 `{tgt_type}`，无法合并。")
-        return
-
-    delete_source = st.checkbox(
-        "合并后删除源字段", value=True, key="merge_del_src",
-        help="勾选后，合并完成会从数据集中移除源字段",
-    )
-
-    if st.button("🔀 执行合并", key="btn_merge_fields"):
-        with st.spinner(f"正在将 `{source_field}` 合并到 `{target_field}`..."):
-            try:
-                result = dm.merge_label_fields(
-                    ds, source_field, target_field, delete_source=delete_source,
-                )
-                st.session_state["_toast_msg"] = (
-                    f"合并完成：{result['merged']} 个样本已合并"
-                    + (f"，源字段 `{source_field}` 已删除" if result["source_deleted"] else "")
-                )
-                st.rerun()
-            except Exception as e:
-                st.error(f"合并失败: {e}")
-
-
 def _render_field_management(ds):
     import fiftyone as fo
 
     st.subheader("字段管理")
 
-    sub_add, sub_del = st.tabs(["➕ 添加字段", "⚠️ 删除字段"])
+    sub_add, sub_del, sub_merge = st.tabs(["➕ 添加字段", "⚠️ 删除字段", "🔀 字段合并"])
 
     # ══════════════════════════ 添加字段 ══════════════════════════
     with sub_add:
@@ -619,3 +557,61 @@ def _render_field_management(ds):
                         st.rerun()
                     except Exception as e:
                         st.error(f"删除失败: {e}")
+
+    # ══════════════════════════ 字段合并 ══════════════════════════
+    with sub_merge:
+        st.caption(
+            "将一个标签字段的标注合并到另一个字段中。"
+            "适用于分批导入时使用了不同字段名（如 `batch2_gt`），"
+            "标注完成后需要汇总到统一字段（如 `ground_truth`）。"
+        )
+
+        info_merge = _get_info(ds)
+        label_fields = info_merge.get("label_fields", [])
+
+        if len(label_fields) < 2:
+            st.info("当前数据集只有 0~1 个标签字段，无需合并。需要至少 2 个标签字段才能进行合并操作。")
+            return
+
+        col1, col2 = st.columns(2)
+        with col1:
+            source_field = st.selectbox("源字段（将被合并）", label_fields, key="merge_src")
+            src_stats = dm.get_label_stats(ds, source_field)
+            if src_stats:
+                st.caption(f"包含 {sum(src_stats.values())} 个标注实例 ({len(src_stats)} 类别)")
+            else:
+                st.caption("该字段暂无标注数据")
+
+        with col2:
+            target_options = [f for f in label_fields if f != source_field]
+            target_field = st.selectbox("目标字段（合并到此）", target_options, key="merge_tgt")
+            tgt_stats = dm.get_label_stats(ds, target_field)
+            if tgt_stats:
+                st.caption(f"包含 {sum(tgt_stats.values())} 个标注实例 ({len(tgt_stats)} 类别)")
+            else:
+                st.caption("该字段暂无标注数据")
+
+        src_type = dm.get_field_label_type(ds, source_field)
+        tgt_type = dm.get_field_label_type(ds, target_field)
+        if src_type and tgt_type and src_type != tgt_type:
+            st.error(f"类型不匹配：源字段为 `{src_type}`，目标字段为 `{tgt_type}`，无法合并。")
+            return
+
+        delete_source = st.checkbox(
+            "合并后删除源字段", value=True, key="merge_del_src",
+            help="勾选后，合并完成会从数据集中移除源字段",
+        )
+
+        if st.button("🔀 执行合并", key="btn_merge_fields"):
+            with st.spinner(f"正在将 `{source_field}` 合并到 `{target_field}`..."):
+                try:
+                    result = dm.merge_label_fields(
+                        ds, source_field, target_field, delete_source=delete_source,
+                    )
+                    st.session_state["_toast_msg"] = (
+                        f"合并完成：{result['merged']} 个样本已合并"
+                        + (f"，源字段 `{source_field}` 已删除" if result["source_deleted"] else "")
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"合并失败: {e}")
