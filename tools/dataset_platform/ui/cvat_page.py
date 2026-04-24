@@ -311,27 +311,39 @@ def _render_cvat_pull(ds):
         st.warning("当前数据集没有标注运行记录。")
         anno_key = ""
 
-    cleanup = st.checkbox("拉取后删除 CVAT 端任务", key="pull_cleanup")
-    if cleanup:
-        st.warning("⚠️ 拉取完成后将**永久删除** CVAT 服务器上的对应任务和项目，此操作不可逆！")
-        confirm_cleanup = st.checkbox("我确认要在拉取后删除 CVAT 端任务", key="pull_cleanup_confirm")
-    else:
-        confirm_cleanup = True
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        cleanup = st.checkbox("拉取后删除 CVAT 端任务", key="pull_cleanup")
+        if cleanup:
+            st.warning("⚠️ 拉取完成后将**永久删除** CVAT 服务器上的对应任务和项目，此操作不可逆！")
+            confirm_cleanup = st.checkbox("我确认要在拉取后删除 CVAT 端任务", key="pull_cleanup_confirm")
+        else:
+            confirm_cleanup = True
+    with col_opt2:
+        skip_tagging = st.checkbox(
+            "跳过自动 Job 状态标签", key="pull_skip_tagging",
+            help="大数据集打标签可能耗时较长，勾选后仅拉取标注不打标签。可稍后在 DataHub 手动刷新。",
+        )
 
     pull_disabled = not anno_key or (cleanup and not confirm_cleanup)
     if st.button("📥 拉取标注", key="btn_pull", disabled=pull_disabled):
         if not anno_key:
             st.error("请选择标注运行")
             return
-        with st.spinner("拉取中（完成后会自动标记 Job 状态标签）..."):
+        spinner_msg = "拉取中..." if skip_tagging else "拉取中（完成后会自动标记 Job 状态标签）..."
+        with st.spinner(spinner_msg):
             try:
-                result = cvat_sync.pull_from_cvat(ds, anno_key, cleanup=cleanup)
+                result = cvat_sync.pull_from_cvat(
+                    ds, anno_key, cleanup=cleanup, skip_tagging=skip_tagging,
+                )
                 st.success("✅ 拉取成功，标注已同步到数据集")
                 job_tags = result.get("job_tags", {})
                 if job_tags:
                     st.markdown("**自动标记的 Job 状态标签：**")
                     for tag, count in job_tags.items():
                         st.text(f"  {tag}: {count} 个样本")
+                elif skip_tagging:
+                    st.info("已跳过自动标签，可前往 DataHub 手动刷新 Job 状态标签")
                 st.json(result)
             except Exception as e:
                 st.error(f"拉取失败: {e}")

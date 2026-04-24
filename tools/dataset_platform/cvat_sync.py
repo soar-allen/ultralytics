@@ -480,6 +480,7 @@ def pull_from_cvat(
     samples: fo.Dataset | fo.DatasetView,
     anno_key: str,
     cleanup: bool = False,
+    skip_tagging: bool = False,
 ) -> dict:
     """
     从 CVAT 拉取标注结果。
@@ -488,6 +489,7 @@ def pull_from_cvat(
         samples: 关联的 FiftyOne Dataset 或 DatasetView
         anno_key: 之前推送时使用的标注键
         cleanup: 是否在拉取后删除 CVAT 端的任务
+        skip_tagging: 跳过自动 Job 状态标签（避免大数据集卡顿）
     """
     ds = samples if isinstance(samples, fo.Dataset) else samples._dataset
     logger.info("从 CVAT 拉取标注: anno_key=%s", anno_key)
@@ -552,12 +554,17 @@ def pull_from_cvat(
 
     # 拉取成功后自动按 Job 状态打标签
     job_tags: dict[str, int] = {}
-    try:
-        job_tags = tag_samples_by_job_status(ds, anno_key)
-        if job_tags:
-            logger.info("已自动标记 Job 状态标签: %s", job_tags)
-    except Exception as tag_err:
-        logger.warning("自动标记 Job 状态标签失败（不影响标注拉取）: %s", tag_err)
+    if skip_tagging:
+        logger.info("已跳过自动 Job 状态标签（skip_tagging=True）")
+    else:
+        try:
+            job_tags = tag_samples_by_job_status(ds, anno_key)
+            if job_tags:
+                logger.info("已自动标记 Job 状态标签: %s", job_tags)
+        except KeyboardInterrupt:
+            logger.warning("用户中断了标签操作，标注数据已成功拉取")
+        except Exception as tag_err:
+            logger.warning("自动标记 Job 状态标签失败（不影响标注拉取）: %s", tag_err)
 
     info: dict = {
         "anno_key": anno_key,
@@ -692,9 +699,24 @@ def get_job_details(ds: fo.Dataset, anno_key: str) -> list[dict]:
         每个 Job 的信息列表，包含 job_id / task_id / state / stage /
         assignee / frame 范围 / 关联的 FiftyOne sample_ids 等。
     """
-    results = ds.load_annotation_results(anno_key, **_get_cvat_cred_kwargs())
+    import concurrent.futures
+
+    logger.info("加载标注运行结果 (anno_key=%s)...", anno_key)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                ds.load_annotation_results, anno_key, **_get_cvat_cred_kwargs(),
+            )
+            results = future.result(timeout=60)
+    except concurrent.futures.TimeoutError:
+        raise TimeoutError(
+            f"加载标注运行 '{anno_key}' 超时（60s）。\n"
+            "可能原因：CVAT 服务器响应缓慢。可在 DataHub 刷新 Job 标签时重试。"
+        )
+
     task_ids = getattr(results, "task_ids", [])
     frame_id_map = getattr(results, "frame_id_map", {})
+    logger.info("  task_ids=%s, frame_id_map 条目=%d", task_ids, sum(len(v) for v in frame_id_map.values()))
 
     all_jobs: list[dict] = []
     for tid in task_ids:
@@ -747,6 +769,8 @@ def tag_samples_by_job_status(
     tag_prefix 为 None 时自动根据推送时记录的标注类型选择前缀：
       - detections → ``bbox_``
       - polylines / keypoints / 其它 → ``job_``
+
+    使用逐样本迭代而非 MongoDB 批量操作，确保 Ctrl+C 可中断。
     """
     if isinstance(anno_keys, str):
         anno_keys = [anno_keys]
@@ -761,28 +785,16 @@ def tag_samples_by_job_status(
             label_types = _get_anno_type(ds, key)
             pfx = _tag_prefix_for_types(label_types)
         key_prefix_map[key] = pfx
+        logger.info("获取 anno_key=%s 的 Job 详情 (prefix=%s)...", key, pfx)
         jobs = get_job_details(ds, key)
+        logger.info("  获取到 %d 个 Jobs", len(jobs))
         for j in jobs:
             j["_tag_prefix"] = pfx
         all_jobs.extend(jobs)
 
-    all_sids: list[str] = []
-    for job in all_jobs:
-        all_sids.extend(job["sample_ids"])
-
-    if not all_sids:
-        return {}
-
-    # 清除旧的 job/bbox 状态标签
-    all_view = ds.select(all_sids)
-    existing_tags = all_view.distinct("tags")
+    # 建立 sample_id → 应打的 tags 映射
+    sid_tags: dict[str, set[str]] = {}
     prefixes_to_clean = set(key_prefix_map.values())
-    for old_tag in existing_tags:
-        if any(old_tag.startswith(f"{p}_") for p in prefixes_to_clean):
-            all_view.untag_samples(old_tag)
-
-    # 按最新 Job 状态打标签（每个 job 使用其对应的前缀）
-    tagged: dict[str, int] = {}
     for job in all_jobs:
         sids = job["sample_ids"]
         if not sids:
@@ -790,10 +802,35 @@ def tag_samples_by_job_status(
         pfx = job["_tag_prefix"]
         state_tag = f"{pfx}_{job['state'].replace(' ', '_')}"
         stage_tag = f"{pfx}_{job['stage'].replace(' ', '_')}"
-        view = ds.select(sids)
-        for tag in (state_tag, stage_tag):
-            view.tag_samples(tag)
-            tagged[tag] = tagged.get(tag, 0) + len(sids)
+        for sid in sids:
+            sid_tags.setdefault(sid, set()).update((state_tag, stage_tag))
+
+    if not sid_tags:
+        return {}
+
+    logger.info("开始为 %d 个样本更新状态标签...", len(sid_tags))
+
+    tagged: dict[str, int] = {}
+    done = 0
+    total = len(sid_tags)
+
+    for sample in ds.select(list(sid_tags.keys())).iter_samples(autosave=True):
+        # 清除旧的前缀标签
+        sample.tags = [
+            t for t in (sample.tags or [])
+            if not any(t.startswith(f"{p}_") for p in prefixes_to_clean)
+        ]
+        # 添加新标签
+        new_tags = sid_tags.get(sample.id, set())
+        for tag in new_tags:
+            if tag not in sample.tags:
+                sample.tags.append(tag)
+                tagged[tag] = tagged.get(tag, 0) + 1
+
+        done += 1
+        if done % 200 == 0 or done == total:
+            logger.info("  标签更新进度: %d/%d", done, total)
+
     return tagged
 
 

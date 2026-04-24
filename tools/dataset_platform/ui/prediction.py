@@ -266,7 +266,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         is_polyline = output_mode.startswith("四角")
         pred_field = _field_selector(ds, "sam3", default="predict", field_type_filter=None)
         label_name = st.text_input(
-            "输出类别名", value="Pallet", key="sam3_label_name",
+            "输出类别名", value="pallet", key="sam3_label_name",
             help="所有输出标注统一使用此类别名",
         )
         conf = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05, key="sam3_conf")
