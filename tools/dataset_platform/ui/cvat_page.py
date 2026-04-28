@@ -289,10 +289,10 @@ def _render_cvat_push(ds):
 def _render_cvat_pull(ds):
     st.subheader("从 CVAT 拉取标注")
 
-    runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+    runs = cvat_sync.list_annotation_runs_keys(ds) if hasattr(ds, "list_annotation_runs") else []
     if runs:
         st.success(f"检测到 **{len(runs)}** 个标注运行")
-        anno_key = st.selectbox("选择标注运行", runs, key="pull_anno_key")
+        anno_key = st.selectbox("选择标注运行（最新在前）", runs, key="pull_anno_key")
         try:
             run_info = ds.get_annotation_info(anno_key)
             with st.expander("运行详情", expanded=False):
@@ -357,7 +357,7 @@ def _render_cvat_manage(ds):
         df = pd.DataFrame(runs)
         st.dataframe(df, use_container_width=True)
 
-        del_key = st.selectbox("选择要删除的运行", [r["anno_key"] for r in runs], key="del_run_key")
+        del_key = st.selectbox("选择要删除的运行（最新在前）", [r["anno_key"] for r in runs], key="del_run_key")
         cleanup_cvat = st.checkbox("同时清理 CVAT 端", key="del_cleanup_cvat")
         st.warning(f"⚠️ 即将删除标注运行: **{del_key}**"
                    + ("（同时删除 CVAT 端任务）" if cleanup_cvat else "（仅删除本地记录）"))
@@ -378,7 +378,7 @@ def _render_cvat_manage(ds):
 
 def _render_cvat_review(ds):
     st.subheader("任务状态与审核")
-    runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+    runs = cvat_sync.list_annotation_runs_keys(ds) if hasattr(ds, "list_annotation_runs") else []
     if not runs:
         st.info("暂无标注运行记录。请先推送数据到 CVAT。")
         return

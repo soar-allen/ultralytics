@@ -580,16 +580,35 @@ def pull_from_cvat(
 # ===================================================================
 
 def list_annotation_runs(ds: fo.Dataset) -> list[dict]:
-    """列出数据集上的所有标注运行。"""
+    """列出数据集上的所有标注运行，按创建时间从新到旧排序。"""
     runs = []
     for key in ds.list_annotation_runs():
         info = ds.get_annotation_info(key)
+        ts = info.timestamp if hasattr(info, "timestamp") else None
         runs.append({
             "anno_key": key,
-            "timestamp": str(info.timestamp) if hasattr(info, "timestamp") else "N/A",
+            "timestamp": str(ts) if ts else "N/A",
             "config": str(info.config) if hasattr(info, "config") else "N/A",
+            "_ts": ts,
         })
+    runs.sort(key=lambda r: r["_ts"] or "", reverse=True)
+    for r in runs:
+        r.pop("_ts", None)
     return runs
+
+
+def list_annotation_runs_keys(ds: fo.Dataset) -> list[str]:
+    """返回按创建时间从新到旧排序的 anno_key 列表。"""
+    pairs = []
+    for key in ds.list_annotation_runs():
+        try:
+            info = ds.get_annotation_info(key)
+            ts = info.timestamp if hasattr(info, "timestamp") else None
+        except Exception:
+            ts = None
+        pairs.append((key, ts))
+    pairs.sort(key=lambda p: p[1] or "", reverse=True)
+    return [k for k, _ in pairs]
 
 
 def delete_annotation_run(ds: fo.Dataset, anno_key: str, cleanup: bool = False) -> None:

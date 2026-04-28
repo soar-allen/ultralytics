@@ -34,14 +34,16 @@ def _render_training_page():
         st.info("请先选择数据集")
         return
 
-    tab_train, tab_progress, tab_feedback = st.tabs([
-        "🚀 训练配置与启动", "📊 训练进度与历史", "🔄 训练后回灌",
+    tab_train, tab_progress, tab_predict, tab_feedback = st.tabs([
+        "🚀 训练配置与启动", "📊 训练进度与历史", "🔮 通用预测", "🔄 训练后回灌",
     ])
 
     with tab_train:
         _render_train_config(ds)
     with tab_progress:
         _render_progress_and_history(ds)
+    with tab_predict:
+        _render_predict(ds)
     with tab_feedback:
         _render_train_feedback(ds)
 
@@ -102,15 +104,15 @@ def _render_train_config(ds):
             key="train_task",
         )
 
-        _DEFAULT_PROJECT = "runs/pose"
+        _default_project = f"/home/cotek/ws_cotek/ultralytics/runs/{task}"
         project_source = st.radio(
             "训练输出目录", ["默认路径", "自定义路径"],
             key="train_project_source", horizontal=True,
         )
         if project_source == "默认路径":
             project_dir = st.text_input(
-                "输出目录 (project)", value=_DEFAULT_PROJECT, key="train_project",
-                help=f"默认: `{_DEFAULT_PROJECT}`，训练产出保存在此目录下",
+                "输出目录 (project)", value=_default_project, key=f"train_project_{task}",
+                help=f"默认: `{_default_project}`，训练产出保存在此目录下",
             )
         else:
             project_dir = _path_browser(
@@ -485,6 +487,231 @@ def _render_epoch_chart(epoch_history: list[dict]):
         if map_cols:
             st.caption("精度曲线")
             st.line_chart(df[map_cols])
+
+
+# ═══════════════════ 通用预测 ═══════════════════
+
+_SUPPORTED_TASKS = ["detect", "segment", "pose", "obb", "classify"]
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
+_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"}
+
+
+def _render_predict(ds):
+    st.subheader("通用预测")
+    st.caption("基于 predict.py，使用训练好的模型对任意输入源执行推理预测。")
+
+    # ── 模型选择 ──
+    st.markdown("#### 🧠 模型权重")
+    last_best = ds.info.get("last_best_pt", "")
+    history = trainer.get_training_history(ds)
+    weight_options = [h.get("best_pt", "") for h in reversed(history) if h.get("best_pt")]
+
+    model_source = st.radio(
+        "权重来源",
+        ["最新 best.pt", "历史权重", "自定义路径", "输入模型名称"],
+        key="pred_model_source", horizontal=True,
+    )
+
+    pred_model = ""
+    if model_source == "最新 best.pt":
+        if last_best and Path(last_best).exists():
+            pred_model = last_best
+            st.info(f"使用最新权重: `{Path(last_best).name}` — `{last_best}`")
+        elif last_best:
+            st.warning(f"最新权重文件不存在: `{last_best}`，请选择其他来源")
+        else:
+            st.warning("暂无训练权重记录。请先完成训练或选择其他来源。")
+    elif model_source == "历史权重":
+        if weight_options:
+            pred_model = st.selectbox(
+                "选择历史权重（最新在前）", weight_options,
+                format_func=lambda p: Path(p).name,
+                key="pred_hist_weight",
+            )
+        else:
+            st.warning("暂无历史权重记录")
+    elif model_source == "自定义路径":
+        pred_model = _path_browser(
+            "模型权重 (.pt)", "pred_model_browser", mode="file",
+            file_extensions=(".pt", ".pth", ".onnx", ".engine"),
+            start_dir=str(Path(last_best).parent) if last_best and Path(last_best).parent.exists() else "",
+        )
+    else:
+        pred_model = st.text_input(
+            "模型名称", value="yolo11n.pt", key="pred_model_name",
+            help="Ultralytics 预训练模型名称",
+        )
+
+    st.markdown("---")
+
+    # ── 输入源 ──
+    st.markdown("#### 📂 输入源")
+    _DEFAULT_SOURCE = "/home/cotek/ws_cotek/ultralytics/detection_images"
+    source_type = st.radio(
+        "输入源类型",
+        ["默认文件夹", "自定义文件夹", "图片/视频文件", "URL / 流地址"],
+        key="pred_source_type", horizontal=True,
+    )
+
+    source = ""
+    if source_type == "默认文件夹":
+        source = st.text_input(
+            "输入源路径", value=_DEFAULT_SOURCE, key="pred_source_default",
+            help=f"默认: `{_DEFAULT_SOURCE}`",
+        )
+        if source and Path(source).is_dir():
+            imgs = [f for f in Path(source).iterdir() if f.suffix.lower() in _IMAGE_EXTS]
+            vids = [f for f in Path(source).iterdir() if f.suffix.lower() in _VIDEO_EXTS]
+            st.caption(f"包含 {len(imgs)} 张图片, {len(vids)} 个视频")
+        elif source:
+            st.warning("⚠️ 目录不存在")
+    elif source_type == "图片/视频文件":
+        source = _path_browser(
+            "选择图片或视频", "pred_source_file", mode="file",
+            file_extensions=tuple(_IMAGE_EXTS | _VIDEO_EXTS),
+        )
+    elif source_type == "自定义文件夹":
+        source = _path_browser(
+            "选择文件夹", "pred_source_dir", mode="directory",
+        )
+        if source and Path(source).is_dir():
+            imgs = [f for f in Path(source).iterdir() if f.suffix.lower() in _IMAGE_EXTS]
+            vids = [f for f in Path(source).iterdir() if f.suffix.lower() in _VIDEO_EXTS]
+            st.caption(f"包含 {len(imgs)} 张图片, {len(vids)} 个视频")
+    else:
+        source = st.text_input(
+            "URL / 流地址", value="", key="pred_source_url",
+            placeholder="http://... 或 rtsp://...",
+        )
+
+    st.markdown("---")
+
+    # ── 推理参数 ──
+    st.markdown("#### ⚙️ 推理参数")
+    col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+    with col_p1:
+        pred_task = st.selectbox("任务类型", [None] + _SUPPORTED_TASKS,
+                                 format_func=lambda x: "自动检测" if x is None else x,
+                                 key="pred_task")
+    with col_p2:
+        pred_conf = st.slider("置信度", 0.0, 1.0, 0.4, 0.05, key="pred_conf")
+    with col_p3:
+        pred_iou = st.slider("NMS IoU", 0.0, 1.0, 0.2, 0.05, key="pred_iou")
+    with col_p4:
+        pred_imgsz = st.number_input("图片尺寸", 32, 1920, 640, step=32, key="pred_imgsz")
+
+    col_p5, col_p6, col_p7 = st.columns(3)
+    with col_p5:
+        pred_device = st.text_input("Device", value="0", key="pred_device",
+                                    help="GPU 编号如 0，或 cpu")
+    with col_p6:
+        pred_max_det = st.number_input("最大检测数", 1, 10000, 300, key="pred_max_det")
+    with col_p7:
+        pred_half = st.checkbox("FP16 半精度", value=False, key="pred_half")
+
+    # ── 输出控制 ──
+    with st.expander("📁 输出控制", expanded=False):
+        col_o1, col_o2 = st.columns(2)
+        with col_o1:
+            pred_save = st.checkbox("保存标注图/视频", value=True, key="pred_save")
+            pred_save_txt = st.checkbox("保存 txt 标签", value=False, key="pred_save_txt")
+            pred_save_conf = st.checkbox("txt 中包含置信度", value=False, key="pred_save_conf")
+            pred_save_crop = st.checkbox("保存裁剪目标", value=False, key="pred_save_crop")
+        with col_o2:
+            pred_project = st.text_input(
+                "输出目录 (project)", value="", key="pred_project",
+                placeholder="留空则自动 runs/{task}",
+            )
+            pred_name = st.text_input(
+                "子目录名 (name)", value="predict", key="pred_run_name",
+            )
+            pred_exist_ok = st.checkbox("允许覆盖已有目录", value=False, key="pred_exist_ok")
+
+    # ── 显示控制 ──
+    with st.expander("👁️ 显示控制", expanded=False):
+        col_v1, col_v2, col_v3 = st.columns(3)
+        with col_v1:
+            pred_show_labels = st.checkbox("显示标签", value=True, key="pred_show_labels")
+        with col_v2:
+            pred_show_conf = st.checkbox("显示置信度", value=True, key="pred_show_conf")
+        with col_v3:
+            pred_line_width = st.number_input("边框线宽 (0=自动)", 0, 20, 0, key="pred_line_width")
+
+    st.markdown("---")
+
+    # ── 执行预测 ──
+    if st.button("🔮 开始预测", key="btn_start_predict", type="primary"):
+        if not pred_model:
+            st.error("请选择或输入模型权重")
+            return
+        if not source:
+            st.error("请指定输入源")
+            return
+
+        with st.spinner("正在执行预测..."):
+            try:
+                from ultralytics import YOLO
+                model = YOLO(pred_model, task=pred_task if pred_task else None)
+
+                project = pred_project.strip() or None
+                predict_kwargs = dict(
+                    source=source,
+                    conf=pred_conf,
+                    iou=pred_iou,
+                    imgsz=pred_imgsz,
+                    device=int(pred_device) if pred_device.strip().isdigit() else pred_device.strip(),
+                    max_det=pred_max_det,
+                    save=pred_save,
+                    save_txt=pred_save_txt,
+                    save_conf=pred_save_conf,
+                    save_crop=pred_save_crop,
+                    project=project,
+                    name=pred_name,
+                    exist_ok=pred_exist_ok,
+                    show_labels=pred_show_labels,
+                    show_conf=pred_show_conf,
+                    half=pred_half,
+                )
+                if pred_task:
+                    predict_kwargs["task"] = pred_task
+                if pred_line_width > 0:
+                    predict_kwargs["line_width"] = pred_line_width
+
+                results = list(model.predict(**predict_kwargs))
+
+                total_det = 0
+                for r in results:
+                    if r.boxes is not None:
+                        total_det += len(r.boxes)
+                    elif r.obb is not None:
+                        total_det += len(r.obb)
+
+                save_dir = results[0].save_dir if results and hasattr(results[0], "save_dir") else None
+
+                st.success("预测完成")
+                col_r1, col_r2, col_r3 = st.columns(3)
+                col_r1.metric("处理文件数", len(results))
+                col_r2.metric("总检测数", total_det)
+                if save_dir:
+                    col_r3.metric("输出目录", str(save_dir))
+
+                # 展示部分预测结果图
+                if pred_save and save_dir and Path(save_dir).is_dir():
+                    preview_imgs = sorted(Path(save_dir).glob("*.jpg"))[:6]
+                    if not preview_imgs:
+                        preview_imgs = sorted(Path(save_dir).glob("*.png"))[:6]
+                    if preview_imgs:
+                        st.markdown("**预测结果预览**")
+                        preview_cols = st.columns(min(len(preview_imgs), 3))
+                        for i, img_path in enumerate(preview_imgs):
+                            preview_cols[i % len(preview_cols)].image(
+                                str(img_path), caption=img_path.name, use_container_width=True,
+                            )
+
+            except Exception as e:
+                st.error(f"预测失败: {e}")
+                import traceback
+                st.code(traceback.format_exc())
 
 
 def _render_train_feedback(ds):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from tools.dataset_platform import cvat_sync
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform.ui.components import _get_ds, _get_info
 
@@ -183,7 +184,7 @@ def _render_annotation_consistency(ds, label_field: str):
     st.subheader("标注一致性分析")
     st.caption("分析不同 anno_key 之间的标注分布差异，检测标注员偏差")
 
-    runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+    runs = cvat_sync.list_annotation_runs_keys(ds) if hasattr(ds, "list_annotation_runs") else []
     if not runs:
         st.info("当前数据集没有标注运行记录，无法分析标注一致性。")
         return

@@ -833,3 +833,26 @@ def _export_obb_from_detections(
         total += count
 
     return {"exported": total, "per_split": per_split, "classes": list(class_map.keys())}
+
+
+# ===================================================================
+# 纯图片导出
+# ===================================================================
+
+def export_images_only(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: str | Path,
+) -> dict:
+    """将样本的图片文件复制到输出目录，不导出标签和 data.yaml。"""
+    output_dir = Path(output_dir).resolve()
+    img_dir = _ensure_dir(output_dir)
+
+    total = 0
+    for sample in ds.iter_samples(progress=True):
+        fp = Path(sample.filepath)
+        if fp.exists():
+            _copy_image(fp, img_dir)
+            total += 1
+
+    logger.info("纯图片导出: %d 张图片 -> %s", total, output_dir)
+    return {"exported": total, "output_dir": str(output_dir)}

@@ -247,10 +247,10 @@ def _render_hub_tag_filter(ds, info: dict):
         "然后通过上方的 Tags 筛选来查看特定状态的样本。"
     )
 
-    runs = ds.list_annotation_runs() if hasattr(ds, "list_annotation_runs") else []
+    runs = cvat_sync.list_annotation_runs_keys(ds) if hasattr(ds, "list_annotation_runs") else []
     if runs:
         refresh_keys = st.multiselect(
-            "选择标注运行", runs, default=runs, key="hub_refresh_keys",
+            "选择标注运行（最新在前）", runs, default=runs, key="hub_refresh_keys",
             help="选择要刷新状态标签的标注运行",
         )
         if st.button("🔄 刷新 Job 状态标签", key="hub_refresh_tags"):
