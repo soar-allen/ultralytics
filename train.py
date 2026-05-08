@@ -2,7 +2,7 @@ import albumentations as A
 
 from ultralytics import YOLO
 
-model = YOLO("yolo11m-pose.pt")
+model = YOLO("yolo11s-pose.pt")
 
 # AGV 托盘识别场景的 Albumentations 自定义增强
 # 模拟仓库中常见的图像质量问题：运动模糊、传感器噪声、低光照对比度差
