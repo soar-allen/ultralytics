@@ -43,24 +43,6 @@ def _render_hub_statistics(ds, info: dict):
         total_labels += sum(stats.values()) if stats else 0
     col_m4.metric("📝 标注实例总数", total_labels)
 
-    # --- FiftyOne 查看入口 ---
-    st.markdown("---")
-    port = st.session_state.fo_port
-    fo_col1, fo_col2 = st.columns([3, 1])
-    with fo_col1:
-        st.subheader("🔍 在 FiftyOne 中查看完整数据集")
-        st.caption("点击下方按钮启动 FiftyOne App，将在新浏览器标签页中打开可视化界面")
-    with fo_col2:
-        if st.button("🚀 启动 / 刷新 FiftyOne App", key="btn_launch_fo"):
-            try:
-                session = dm.launch_app(ds, port=port)
-                st.session_state.fo_session = session
-                st.success(f"FiftyOne App 已启动 (端口 {port})")
-            except Exception as e:
-                st.error(f"启动失败: {e}")
-        fo_url = f"http://localhost:{port}"
-        st.link_button("🌐 打开 FiftyOne 查看", fo_url)
-
     # --- Label 统计 ---
     st.markdown("---")
     st.subheader("📊 标注类别统计")
@@ -206,14 +188,14 @@ def _render_hub_tag_filter(ds, info: dict):
         with col_fo:
             st.markdown("**在 FiftyOne 中查看**")
             if st.button("👁️ 在 FiftyOne App 中展示筛选结果", key="hub_fo_view"):
-                session = dm.get_session()
-                if session:
+                try:
+                    port = st.session_state.fo_port
+                    dm.ensure_app(ds, port=port)
                     dm.set_session_view(filtered_view)
                     st.success("✅ 已更新 FiftyOne App 视图为筛选结果")
-                    port = st.session_state.fo_port
                     st.link_button("🌐 打开 FiftyOne 查看", f"http://localhost:{port}")
-                else:
-                    st.warning("请先在「数据集统计」Tab 中启动 FiftyOne App")
+                except Exception as e:
+                    st.error(f"启动 FiftyOne App 失败: {e}")
 
         with col_cvat:
             st.markdown("**在 CVAT 中查看**")

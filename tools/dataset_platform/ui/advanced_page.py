@@ -61,10 +61,9 @@ def _render_hard_mining(ds):
                     )
                     st.info(f"找到 {len(hard_view)} 个难例样本")
                     st.session_state["_hard_view"] = hard_view
-                    session = dm.get_session()
-                    if session:
-                        dm.set_session_view(hard_view)
-                        st.success("✅ 已在 FiftyOne App 中展示难例")
+                    dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                    dm.set_session_view(hard_view)
+                    st.success("✅ 已在 FiftyOne App 中展示难例")
                 except Exception as e:
                     st.error(f"挖掘失败: {e}")
 
@@ -134,18 +133,16 @@ def _render_brain(ds):
                 n_dup = st.number_input("显示最相似（最不唯一）的 N 个", value=20, key="uniq_n_dup")
                 if st.button("查看最不唯一样本", key="btn_uniq_low"):
                     view = ds.sort_by("uniqueness")[:n_dup]
-                    session = dm.get_session()
-                    if session:
-                        dm.set_session_view(view)
-                        st.success(f"✅ 已展示 uniqueness 最低的 {n_dup} 个样本")
+                    dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                    dm.set_session_view(view)
+                    st.success(f"✅ 已展示 uniqueness 最低的 {n_dup} 个样本")
             with col2:
                 n_unique = st.number_input("显示最独特的 N 个", value=20, key="uniq_n_unique")
                 if st.button("查看最独特样本", key="btn_uniq_high"):
                     view = ds.sort_by("uniqueness", reverse=True)[:n_unique]
-                    session = dm.get_session()
-                    if session:
-                        dm.set_session_view(view)
-                        st.success(f"✅ 已展示 uniqueness 最高的 {n_unique} 个样本")
+                    dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                    dm.set_session_view(view)
+                    st.success(f"✅ 已展示 uniqueness 最高的 {n_unique} 个样本")
 
             if st.button("📊 查看统计", key="btn_uniq_stats"):
                 try:
@@ -178,10 +175,9 @@ def _render_brain(ds):
             n_hard = st.number_input("显示最难的 N 个", value=30, key="hard_brain_n")
             if st.button("查看最难样本", key="btn_hard_brain_view"):
                 view = ds.sort_by("hardness", reverse=True)[:n_hard]
-                session = dm.get_session()
-                if session:
-                    dm.set_session_view(view)
-                    st.success(f"✅ 已展示 hardness 最高的 {n_hard} 个样本")
+                dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                dm.set_session_view(view)
+                st.success(f"✅ 已展示 hardness 最高的 {n_hard} 个样本")
 
     with tab_repr:
         st.markdown("""
@@ -203,10 +199,9 @@ def _render_brain(ds):
             n_repr = st.number_input("显示代表性最低的 N 个", value=20, key="repr_n")
             if st.button("查看最不具代表性的样本", key="btn_repr_low"):
                 view = ds.sort_by("representativeness")[:n_repr]
-                session = dm.get_session()
-                if session:
-                    dm.set_session_view(view)
-                    st.success(f"✅ 已展示代表性最低的 {n_repr} 个样本")
+                dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                dm.set_session_view(view)
+                st.success(f"✅ 已展示代表性最低的 {n_repr} 个样本")
 
 
 def _render_backup(ds):

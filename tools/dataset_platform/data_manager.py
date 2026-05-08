@@ -510,6 +510,13 @@ def get_session() -> Optional[fo.Session]:
     return _session
 
 
+def ensure_app(ds: fo.Dataset, port: Optional[int] = None) -> fo.Session:
+    """确保 FiftyOne App 已启动，未启动则自动启动。返回 session。"""
+    if _is_session_alive():
+        return _session
+    return launch_app(ds, port=port)
+
+
 def set_session_view(view: fo.DatasetView) -> None:
     """设置当前 session 的视图。"""
     global _session

@@ -471,10 +471,9 @@ def _render_cvat_review(ds):
             st.warning(f"发现 **{discard_count}** 个被标记为废弃的样本")
 
             if st.button("👁️ 在 FiftyOne App 中查看废弃样本", key="btn_view_discarded"):
-                session = dm.get_session()
-                if session:
-                    dm.set_session_view(discarded)
-                    st.success("✅ 已在 FiftyOne App 中展示废弃样本")
+                dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                dm.set_session_view(discarded)
+                st.success("✅ 已在 FiftyOne App 中展示废弃样本")
 
             discard_action = st.radio(
                 "处理方式",

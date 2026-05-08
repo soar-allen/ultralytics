@@ -303,21 +303,18 @@ def _render_area_analysis(ds, label_field: str):
         if small_samples:
             st.warning(f"⚠️ {len(small_samples)} 个样本包含异常小标注 (< {min_area_pct}% 图像面积)")
             if st.button("👁️ 查看异常小标注样本", key="btn_view_small"):
-                from fiftyone import ViewField as F
                 view = ds.select(list(small_samples))
-                session = dm.get_session()
-                if session:
-                    dm.set_session_view(view)
-                    st.success("已在 FiftyOne 中展示")
+                dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                dm.set_session_view(view)
+                st.success("已在 FiftyOne 中展示")
 
         if large_samples:
             st.warning(f"⚠️ {len(large_samples)} 个样本包含异常大标注 (> {max_area_pct}% 图像面积)")
             if st.button("👁️ 查看异常大标注样本", key="btn_view_large"):
                 view = ds.select(list(large_samples))
-                session = dm.get_session()
-                if session:
-                    dm.set_session_view(view)
-                    st.success("已在 FiftyOne 中展示")
+                dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                dm.set_session_view(view)
+                st.success("已在 FiftyOne 中展示")
 
 
 def _render_empty_annotations(ds, label_field: str):
@@ -337,10 +334,9 @@ def _render_empty_annotations(ds, label_field: str):
             st.warning(f"发现 **{len(empty_ids)}** 个样本有标注字段但内容为空")
             if st.button("👁️ 在 FiftyOne 中查看", key="btn_view_empty"):
                 view = ds.select(empty_ids)
-                session = dm.get_session()
-                if session:
-                    dm.set_session_view(view)
-                    st.success("已在 FiftyOne 中展示")
+                dm.ensure_app(ds, port=st.session_state.get("fo_port"))
+                dm.set_session_view(view)
+                st.success("已在 FiftyOne 中展示")
             st.caption("这些样本可能是标注过程中被跳过的图像，建议重新标注或标记为无目标。")
         else:
             st.success("✅ 未发现空标注样本")

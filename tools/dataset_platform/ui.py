@@ -82,11 +82,30 @@ def _render_active_page(page: str):
         _render_advanced()
 
 
+def _auto_start_fiftyone():
+    """平台启动时自动启动 FiftyOne App（仅首次执行）。"""
+    if st.session_state.get("_fo_auto_started"):
+        return
+    ds_name = st.session_state.get("current_dataset")
+    if not ds_name:
+        return
+    try:
+        from tools.dataset_platform import data_manager as dm
+        ds = dm.load_dataset(ds_name)
+        port = st.session_state.get("fo_port", 5151)
+        session = dm.ensure_app(ds, port=port)
+        st.session_state.fo_session = session
+        st.session_state["_fo_auto_started"] = True
+    except Exception:
+        pass
+
+
 def main():
     if "_toast_msg" in st.session_state:
         st.toast(st.session_state.pop("_toast_msg"), icon="✅")
 
     _render_sidebar()
+    _auto_start_fiftyone()
 
     active = st.session_state.get("_active_page", _PAGES[0])
     _render_active_page(active)
