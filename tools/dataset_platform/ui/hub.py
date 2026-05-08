@@ -43,6 +43,30 @@ def _render_hub_statistics(ds, info: dict):
         total_labels += sum(stats.values()) if stats else 0
     col_m4.metric("📝 标注实例总数", total_labels)
 
+    # --- Tags 统计 ---
+    st.markdown("---")
+    st.subheader("🔖 样本 Tags 统计")
+
+    available_tags = info["tags"]
+    if available_tags:
+        tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
+        if tag_counts:
+            df_tags = pd.DataFrame(
+                list(tag_counts.items()), columns=["标签", "样本数"]
+            ).sort_values("样本数", ascending=False)
+
+            chart_col, table_col = st.columns([2, 1])
+            with chart_col:
+                st.bar_chart(df_tags.set_index("标签"))
+            with table_col:
+                st.dataframe(df_tags, use_container_width=True, hide_index=True)
+                st.caption(
+                    f"共 **{len(tag_counts)}** 种标签，"
+                    f"一个样本可拥有多个标签"
+                )
+    else:
+        st.info("当前数据集没有任何样本 Tags")
+
     # --- Label 统计 ---
     st.markdown("---")
     st.subheader("📊 标注类别统计")
@@ -69,30 +93,6 @@ def _render_hub_statistics(ds, info: dict):
                     st.info("该字段暂无标注数据")
     else:
         st.info("当前数据集没有标签字段，请先导入标注数据")
-
-    # --- Tags 统计 ---
-    st.markdown("---")
-    st.subheader("🔖 样本 Tags 统计")
-
-    available_tags = info["tags"]
-    if available_tags:
-        tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
-        if tag_counts:
-            df_tags = pd.DataFrame(
-                list(tag_counts.items()), columns=["标签", "样本数"]
-            ).sort_values("样本数", ascending=False)
-
-            chart_col, table_col = st.columns([2, 1])
-            with chart_col:
-                st.bar_chart(df_tags.set_index("标签"))
-            with table_col:
-                st.dataframe(df_tags, use_container_width=True, hide_index=True)
-                st.caption(
-                    f"共 **{len(tag_counts)}** 种标签，"
-                    f"一个样本可拥有多个标签"
-                )
-    else:
-        st.info("当前数据集没有任何样本 Tags")
 
     # --- 修复重复 Tags ---
     st.markdown("---")
