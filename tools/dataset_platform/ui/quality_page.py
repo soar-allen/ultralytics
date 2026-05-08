@@ -89,6 +89,172 @@ def _render_class_balance(ds, label_field: str):
     imbalance_ratio = max(class_counts.values()) / min(class_counts.values()) if min(class_counts.values()) > 0 else float("inf")
     st.metric("最大/最小类别比", f"{imbalance_ratio:.1f}x")
 
+    # ── 过采样工具 ──
+    st.markdown("---")
+    st.markdown("### 🔄 过采样工具")
+    st.caption("通过复制少数类样本及其标注来平衡类别分布。复制的样本会带有 `oversampled` 标签，并可选数据增强。")
+
+    max_cls = max(class_counts, key=class_counts.get)
+    max_cnt = class_counts[max_cls]
+
+    minority_classes = [cls for cls, cnt in class_counts.items() if cnt < max_cnt]
+    if not minority_classes:
+        st.success("所有类别数量相同，无需过采样")
+        return
+
+    target_mode = st.radio(
+        "目标数量策略",
+        ["对齐到最大类", "自定义目标数量"],
+        key="qa_oversample_mode", horizontal=True,
+    )
+
+    if target_mode == "对齐到最大类":
+        target_count = max_cnt
+        st.info(f"将所有少数类对齐到 **{max_cls}** 的数量: **{max_cnt}**")
+    else:
+        target_count = st.number_input(
+            "每个类别的目标实例数", min_value=1, value=max_cnt,
+            key="qa_oversample_target",
+        )
+
+    selected_minority = st.multiselect(
+        "选择需要过采样的类别",
+        minority_classes,
+        default=minority_classes,
+        key="qa_oversample_classes",
+    )
+
+    if selected_minority:
+        plan_rows = []
+        for cls in selected_minority:
+            cur = class_counts[cls]
+            need = max(0, target_count - cur)
+            plan_rows.append({"类别": cls, "当前实例数": cur, "目标": target_count, "需复制样本约": need})
+        st.dataframe(plan_rows, use_container_width=True, hide_index=True)
+
+    use_augment = st.checkbox(
+        "对复制样本应用随机增强（翻转 + 色彩抖动）", value=True,
+        key="qa_oversample_augment",
+        help="增强后的样本多样性更好，训练效果更佳",
+    )
+
+    if st.button("🚀 执行过采样", key="btn_oversample", type="primary"):
+        if not selected_minority:
+            st.error("请至少选择一个类别")
+            return
+
+        import random
+        import shutil
+        from pathlib import Path
+
+        try:
+            import cv2
+            import numpy as np
+            has_cv2 = True
+        except ImportError:
+            has_cv2 = False
+
+        progress_bar = st.progress(0, text="准备中...")
+        total_added = 0
+        class_added = {}
+
+        cls_sample_map: dict[str, list] = {cls: [] for cls in selected_minority}
+        for sample in ds.iter_samples():
+            labels = sample.get_field(label_field)
+            if labels is None:
+                continue
+            items = getattr(labels, "detections", None) or getattr(labels, "polylines", None) or []
+            sample_classes = {item.label for item in items if hasattr(item, "label")}
+            for cls in selected_minority:
+                if cls in sample_classes:
+                    cls_sample_map[cls].append(sample)
+
+        total_ops = sum(max(0, target_count - class_counts[cls]) for cls in selected_minority)
+        done_ops = 0
+
+        for cls in selected_minority:
+            cur_count = class_counts[cls]
+            need = max(0, target_count - cur_count)
+            if need == 0 or not cls_sample_map[cls]:
+                continue
+
+            source_samples = cls_sample_map[cls]
+            added = 0
+            for i in range(need):
+                src = random.choice(source_samples)
+                src_path = Path(src.filepath)
+                if not src_path.exists():
+                    continue
+
+                stem = src_path.stem
+                ext = src_path.suffix
+                new_name = f"{stem}_os{i}{ext}"
+                new_path = src_path.parent / new_name
+                counter = 0
+                while new_path.exists():
+                    counter += 1
+                    new_name = f"{stem}_os{i}_{counter}{ext}"
+                    new_path = src_path.parent / new_name
+
+                if use_augment and has_cv2:
+                    img = cv2.imread(str(src_path))
+                    if img is not None:
+                        if random.random() > 0.5:
+                            img = cv2.flip(img, 1)
+                        if random.random() > 0.5:
+                            img = cv2.flip(img, 0)
+                        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+                        hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-10, 10)) % 180
+                        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.8, 1.2), 0, 255)
+                        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * random.uniform(0.8, 1.2), 0, 255)
+                        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+                        cv2.imwrite(str(new_path), img)
+                    else:
+                        shutil.copy2(src_path, new_path)
+                else:
+                    shutil.copy2(src_path, new_path)
+
+                new_sample = fo.Sample(filepath=str(new_path))
+                new_sample.tags.append("oversampled")
+                new_sample.tags.append(f"os_{cls}")
+
+                src_labels = src.get_field(label_field)
+                if src_labels is not None:
+                    new_sample[label_field] = src_labels.copy()
+
+                for field_name in src.field_names:
+                    if field_name in ("id", "filepath", "tags", "metadata", label_field):
+                        continue
+                    try:
+                        val = src.get_field(field_name)
+                        if val is not None and hasattr(val, "copy"):
+                            new_sample[field_name] = val.copy()
+                        elif val is not None:
+                            new_sample[field_name] = val
+                    except Exception:
+                        pass
+
+                ds.add_sample(new_sample)
+                added += 1
+                done_ops += 1
+                if done_ops % 20 == 0 or done_ops == total_ops:
+                    progress_bar.progress(
+                        min(done_ops / total_ops, 1.0),
+                        text=f"过采样中... {done_ops}/{total_ops}",
+                    )
+
+            class_added[cls] = added
+            total_added += added
+
+        progress_bar.progress(1.0, text="完成")
+        st.success(f"✅ 过采样完成，共新增 **{total_added}** 个样本")
+        for cls, cnt in class_added.items():
+            st.caption(f"  - **{cls}**: +{cnt} 个样本")
+        st.info(
+            "新增样本已标记 `oversampled` 标签。\n"
+            "导出训练时请包含所有样本。如需撤销，可在 DataHub 中按 `oversampled` 标签筛选后删除。"
+        )
+
 
 def _render_area_analysis(ds, label_field: str):
     st.subheader("标注面积分析")

@@ -208,6 +208,31 @@ def _render_train_config(ds):
         with col_m3:
             mixup = st.slider("mixup", 0.0, 1.0, 0.0, 0.1, key="train_mixup")
 
+    # ═══════════════════ 损失函数与类别平衡 ═══════════════════
+    with st.expander("⚖️ 损失函数与类别平衡", expanded=False):
+        st.caption("类别不平衡时，开启 Focal Loss 并提高 cls 权重可显著改善少数类识别效果")
+        col_fl, col_cls, col_box, col_dfl = st.columns(4)
+        with col_fl:
+            fl_gamma = st.number_input(
+                "Focal Loss gamma", 0.0, 5.0, 0.0, 0.5, key="train_fl_gamma",
+                help="默认 0.0（关闭）。设为 1.0~2.0 自动关注难分类样本，缓解类别不平衡",
+            )
+        with col_cls:
+            cls_weight = st.number_input(
+                "cls (分类损失权重)", 0.0, 10.0, 0.5, 0.1, key="train_cls",
+                help="默认 0.5。类别不平衡时可提高到 1.0~2.0",
+            )
+        with col_box:
+            box_weight = st.number_input(
+                "box (框回归损失权重)", 0.0, 20.0, 7.5, 0.5, key="train_box",
+                help="默认 7.5",
+            )
+        with col_dfl:
+            dfl_weight = st.number_input(
+                "dfl (分布焦点损失权重)", 0.0, 10.0, 1.5, 0.1, key="train_dfl",
+                help="默认 1.5",
+            )
+
     # ═══════════════════ 优化器与学习率 ═══════════════════
     with st.expander("📈 优化器与学习率", expanded=False):
         col_lr, col_wd, col_opt = st.columns(3)
@@ -220,6 +245,13 @@ def _render_train_config(ds):
         with col_opt:
             optimizer = st.selectbox("优化器", ["auto", "SGD", "Adam", "AdamW"],
                                      key="train_optimizer")
+        col_cos, col_pat = st.columns(2)
+        with col_cos:
+            cos_lr = st.checkbox("余弦退火学习率 (cos_lr)", value=False, key="train_cos_lr",
+                                 help="使用余弦退火调度，后期学习率平滑下降")
+        with col_pat:
+            patience = st.number_input("早停耐心值 (patience)", 0, 500, 100, key="train_patience",
+                                       help="默认 100。类别不平衡时建议设为 50~100，给模型更多学习少数类的机会")
 
     st.markdown("---")
 
@@ -234,6 +266,8 @@ def _render_train_config(ds):
 
         extra_args = {
             "lr0": lr0, "weight_decay": weight_decay, "optimizer": optimizer,
+            "cos_lr": cos_lr, "patience": patience,
+            "fl_gamma": fl_gamma, "cls": cls_weight, "box": box_weight, "dfl": dfl_weight,
             "hsv_h": hsv_h, "hsv_s": hsv_s, "hsv_v": hsv_v,
             "degrees": degrees, "translate": translate, "scale": scale,
             "shear": shear, "perspective": perspective,
