@@ -115,6 +115,10 @@ def _open_native_dialog(
     Linux: zenity (原生 GTK) → tkinter
     Windows/macOS: tkinter → zenity
     """
+    # normalize alias values
+    if mode == "directory":
+        mode = "dir"
+
     if sys.platform == "linux":
         if shutil.which("zenity"):
             result = _zenity_dialog(mode, title, start_dir, file_extensions)
@@ -134,6 +138,10 @@ def _open_native_dialog(
 def _tkinter_dialog(
     mode: str, title: str, start_dir: str, file_extensions: tuple | None,
 ) -> str | None:
+    # normalize alias values
+    if mode == "directory":
+        mode = "dir"
+
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -167,6 +175,10 @@ def _tkinter_dialog(
 def _zenity_dialog(
     mode: str, title: str, start_dir: str, file_extensions: tuple | None,
 ) -> str | None:
+    # normalize alias values
+    if mode == "directory":
+        mode = "dir"
+
     cmd = ["zenity", "--file-selection", "--title", title]
     if mode == "dir":
         cmd.append("--directory")
@@ -212,22 +224,26 @@ def _path_browser(
     Returns:
         选中的路径字符串
     """
+    # normalize alias values (accept 'directory' as synonym for 'dir')
+    if mode == "directory":
+        mode = "dir"
+
     input_key = f"{key}_input"
     pending_key = f"{key}_pending"
 
     if pending_key in st.session_state:
         st.session_state[input_key] = st.session_state.pop(pending_key)
 
+    current_val = st.session_state.get(input_key, "")
+
     # --- 手动输入 + 浏览按钮 ---
     col_input, col_btn = st.columns([5, 1])
-    with col_input:
-        path_val = st.text_input(label, key=input_key)
     with col_btn:
         st.write("")
         browse_clicked = st.button("📂 浏览", key=f"{key}_browse")
 
     if browse_clicked:
-        initial = path_val or start_dir or str(Path.home())
+        initial = current_val or start_dir or str(Path.home())
         if mode == "dir" and Path(initial).is_file():
             initial = str(Path(initial).parent)
 
@@ -236,12 +252,14 @@ def _path_browser(
             start_dir=initial, file_extensions=file_extensions,
         )
         if chosen:
-            st.session_state[pending_key] = chosen
-            st.rerun()
+            st.session_state[input_key] = chosen
+            current_val = chosen
         else:
             # 原生对话框不可用或用户取消 → 展开 Web 浏览器
             st.session_state[f"{key}_show_fallback"] = True
-            st.rerun()
+
+    with col_input:
+        path_val = st.text_input(label, key=input_key)
 
     # --- Web 备用浏览器 ---
     if st.session_state.get(f"{key}_show_fallback", False):
@@ -263,6 +281,10 @@ def _web_path_browser(
     """
     browse_key = f"{key}_cwd"
     nav_key = f"{key}_nav_seq"
+
+    # normalize alias values (accept 'directory' as synonym for 'dir')
+    if mode == "directory":
+        mode = "dir"
 
     if browse_key not in st.session_state:
         st.session_state[browse_key] = (

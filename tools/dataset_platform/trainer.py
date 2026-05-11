@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import fiftyone as fo
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,7 @@ _training_status: dict = {
     "save_dir": None,
     "current_metrics": {},
     "epoch_history": [],
+    "error_trace": None,
 }
 
 
@@ -52,6 +56,7 @@ def _reset_status() -> dict:
         "save_dir": None,
         "current_metrics": {},
         "epoch_history": [],
+        "error_trace": None,
     }
 
 
@@ -99,6 +104,171 @@ def find_data_yaml(directory: str | Path) -> Optional[str]:
     for f in directory.rglob("data.yaml"):
         return str(f)
     return None
+
+
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def _load_data_yaml(data_yaml: str | Path) -> dict:
+    with open(data_yaml, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _names_to_id_map(names) -> dict:
+    if isinstance(names, dict):
+        return {int(k): str(v) for k, v in names.items()}
+    if isinstance(names, (list, tuple)):
+        return {i: str(n) for i, n in enumerate(names)}
+    return {}
+
+
+def _expand_train_sources(train, base_dir: Path) -> list[str]:
+    paths: list[str] = []
+    if isinstance(train, (list, tuple)):
+        for t in train:
+            paths.extend(_expand_train_sources(t, base_dir))
+        return paths
+
+    train_path = Path(train)
+    if not train_path.is_absolute():
+        train_path = (base_dir / train_path).resolve()
+
+    if train_path.is_file() and train_path.suffix.lower() == ".txt":
+        try:
+            with open(train_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    p = line.strip()
+                    if p:
+                        paths.append(p)
+        except OSError:
+            return []
+        return paths
+
+    if train_path.is_dir():
+        for ext in _IMAGE_EXTS:
+            paths.extend(str(p) for p in train_path.rglob(f"*{ext}"))
+        return paths
+
+    if train_path.is_file():
+        return [str(train_path)]
+
+    return []
+
+
+def _label_path_from_image(image_path: str | Path) -> Path:
+    p = Path(image_path)
+    parts = list(p.parts)
+    if "images" in parts:
+        idx = parts.index("images")
+        parts[idx] = "labels"
+        return Path(*parts).with_suffix(".txt")
+    return p.with_suffix(".txt")
+
+
+def _build_balanced_data_yaml(
+    data_yaml: str | Path,
+    balance_classes: list[str],
+    target_ratio: float,
+    max_repeat: int,
+) -> tuple[str, dict | None]:
+    data_yaml = str(data_yaml)
+    data = _load_data_yaml(data_yaml)
+    names_map = _names_to_id_map(data.get("names", {}))
+    name_to_id = {v: k for k, v in names_map.items()}
+    class_ids = [name_to_id[n] for n in balance_classes if n in name_to_id]
+    if not class_ids:
+        return data_yaml, None
+
+    base_dir = Path(data_yaml).parent
+    train_sources = data.get("train")
+    if not train_sources:
+        return data_yaml, None
+
+    image_paths = _expand_train_sources(train_sources, base_dir)
+    if not image_paths:
+        return data_yaml, None
+
+    class_counts = {cid: 0 for cid in class_ids}
+    image_has_minority: dict[str, bool] = {}
+    for img in image_paths:
+        label_path = _label_path_from_image(img)
+        has_minority = False
+        if label_path.exists():
+            try:
+                with open(label_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if not parts:
+                            continue
+                        try:
+                            cls_id = int(float(parts[0]))
+                        except ValueError:
+                            continue
+                        if cls_id in class_counts:
+                            class_counts[cls_id] += 1
+                            has_minority = True
+            except OSError:
+                pass
+        image_has_minority[img] = has_minority
+
+    minority_total = sum(class_counts.values())
+    if minority_total <= 0:
+        return data_yaml, None
+
+    majority_total = 0
+    for img in image_paths:
+        label_path = _label_path_from_image(img)
+        if not label_path.exists():
+            continue
+        try:
+            with open(label_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    try:
+                        cls_id = int(float(parts[0]))
+                    except ValueError:
+                        continue
+                    if cls_id not in class_counts:
+                        majority_total += 1
+        except OSError:
+            pass
+
+    if majority_total <= 0:
+        return data_yaml, None
+
+    desired_minor = max(1, int(majority_total * float(target_ratio)))
+    repeat = min(max_repeat, max(1, math.ceil(desired_minor / minority_total)))
+    if repeat <= 1:
+        return data_yaml, None
+
+    balanced_list: list[str] = []
+    for img in image_paths:
+        balanced_list.append(img)
+        if image_has_minority.get(img):
+            balanced_list.extend([img] * (repeat - 1))
+
+    tmp_dir = Path.home() / ".dataset_platform" / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    list_path = tmp_dir / f"train_balanced_{ts}.txt"
+    yaml_path = tmp_dir / f"data_balanced_{ts}.yaml"
+
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(balanced_list))
+
+    data["train"] = str(list_path)
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    info = {
+        "minority_total": minority_total,
+        "majority_total": majority_total,
+        "repeat": repeat,
+        "train_list": str(list_path),
+    }
+    return str(yaml_path), info
 
 
 def start_training(
@@ -175,8 +345,31 @@ def start_training(
             model.add_callback("on_train_start", _train_start_callback)
             model.add_callback("on_fit_epoch_end", _epoch_end_callback)
 
+            balance_classes = []
+            balance_target_ratio = 0.5
+            balance_max_repeat = 3
+            if extra_args:
+                balance_classes = extra_args.pop("balance_classes", []) or []
+                balance_target_ratio = extra_args.pop("balance_target_ratio", 0.5)
+                balance_max_repeat = extra_args.pop("balance_max_repeat", 3)
+
+            data_yaml_path = data_yaml
+            balance_info = None
+            if balance_classes:
+                data_yaml_path, balance_info = _build_balanced_data_yaml(
+                    data_yaml_path,
+                    balance_classes=balance_classes,
+                    target_ratio=float(balance_target_ratio),
+                    max_repeat=int(balance_max_repeat),
+                )
+                if balance_info:
+                    _training_status["progress"] = (
+                        "已启用少数类重采样: repeat="
+                        f"{balance_info['repeat']}"
+                    )
+
             train_kwargs = dict(
-                data=data_yaml,
+                data=data_yaml_path,
                 epochs=epochs,
                 imgsz=imgsz,
                 batch=batch,
@@ -245,6 +438,7 @@ def start_training(
             _training_status["end_time"] = t_end
             _training_status["duration_seconds"] = t_end - t_start
             _training_status["error"] = str(e)
+            _training_status["error_trace"] = traceback.format_exc()
             _training_status["progress"] = f"训练失败: {e}"
             logger.error("训练失败: %s", e)
         finally:

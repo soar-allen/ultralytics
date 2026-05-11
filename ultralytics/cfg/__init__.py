@@ -181,6 +181,7 @@ CFG_FRACTION_KEYS = frozenset(
         "bgr",
         "mosaic",
         "mixup",
+            "fl_gamma",
         "cutmix",
         "copy_paste",
         "conf",

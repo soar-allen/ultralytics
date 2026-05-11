@@ -210,12 +210,21 @@ def _render_train_config(ds):
 
     # ═══════════════════ 损失函数与类别平衡 ═══════════════════
     with st.expander("⚖️ 损失函数与类别平衡", expanded=False):
-        st.caption("类别不平衡时，开启 Focal Loss 并提高 cls 权重可显著改善少数类识别效果")
-        col_fl, col_cls, col_box, col_dfl = st.columns(4)
-        with col_fl:
-            fl_gamma = st.number_input(
-                "Focal Loss gamma", 0.0, 5.0, 0.0, 0.5, key="train_fl_gamma",
-                help="默认 0.0（关闭）。设为 1.0~2.0 自动关注难分类样本，缓解类别不平衡",
+        st.caption("类别不平衡时，可提高 cls 权重，并启用少数类重采样以缓解偏差")
+        col_bal, col_cls, col_box, col_dfl = st.columns(4)
+        with col_bal:
+            balance_enable = st.checkbox("少数类重采样", value=False, key="train_balance_enable")
+            balance_names = st.text_input(
+                "少数类名称(逗号分隔)", value="tian", key="train_balance_names",
+                help="仅用于训练前构造重采样列表，不影响标注",
+            )
+            balance_ratio = st.number_input(
+                "目标比例(少/多)", 0.1, 1.0, 0.5, 0.1, key="train_balance_ratio",
+                help="重采样后的目标比例，建议 0.3~0.7",
+            )
+            balance_max_repeat = st.number_input(
+                "最大重复倍数", 1, 10, 3, 1, key="train_balance_max_repeat",
+                help="少数类样本最多重复次数",
             )
         with col_cls:
             cls_weight = st.number_input(
@@ -267,13 +276,18 @@ def _render_train_config(ds):
         extra_args = {
             "lr0": lr0, "weight_decay": weight_decay, "optimizer": optimizer,
             "cos_lr": cos_lr, "patience": patience,
-            "fl_gamma": fl_gamma, "cls": cls_weight, "box": box_weight, "dfl": dfl_weight,
+            "cls": cls_weight, "box": box_weight, "dfl": dfl_weight,
             "hsv_h": hsv_h, "hsv_s": hsv_s, "hsv_v": hsv_v,
             "degrees": degrees, "translate": translate, "scale": scale,
             "shear": shear, "perspective": perspective,
             "fliplr": fliplr, "flipud": flipud,
             "mosaic": mosaic, "close_mosaic": close_mosaic, "mixup": mixup,
         }
+        if balance_enable:
+            names = [n.strip() for n in balance_names.split(",") if n.strip()]
+            extra_args["balance_classes"] = names
+            extra_args["balance_target_ratio"] = float(balance_ratio)
+            extra_args["balance_max_repeat"] = int(balance_max_repeat)
 
         result = trainer.start_training(
             data_yaml=data_yaml,
@@ -393,6 +407,10 @@ def _render_progress_and_history(ds):
         dur = status.get("duration_seconds", 0)
         if dur:
             st.caption(f"运行时长: {_fmt_duration(dur)}")
+        trace = status.get("error_trace")
+        if trace:
+            with st.expander("查看详细错误", expanded=False):
+                st.code(trace)
         st.markdown("---")
 
     # ═══════════════════ 训练历史记录 ═══════════════════
