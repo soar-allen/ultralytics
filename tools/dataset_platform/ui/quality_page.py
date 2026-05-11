@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import streamlit as st
+import fiftyone as fo
 
 from tools.dataset_platform import cvat_sync
 from tools.dataset_platform import data_manager as dm
