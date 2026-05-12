@@ -87,6 +87,13 @@ def _transform_labels_for_flip(labels, hflip: bool, vflip: bool):
     return labels
 
 
+def _is_geometric_label_container(value) -> bool:
+    return any(
+        hasattr(value, attr)
+        for attr in ("detections", "polylines", "keypoints")
+    )
+
+
 def _render_quality_page():
     st.header("🔬 标注质量检查")
     ds = _get_ds()
@@ -358,7 +365,9 @@ def _render_class_balance(ds, label_field: str):
                         continue
                     try:
                         val = src.get_field(field_name)
-                        if val is not None and hasattr(val, "copy"):
+                        if val is not None and _is_geometric_label_container(val):
+                            new_sample[field_name] = _transform_labels_for_flip(val, hflip, vflip)
+                        elif val is not None and hasattr(val, "copy"):
                             new_sample[field_name] = val.copy()
                         elif val is not None:
                             new_sample[field_name] = val
