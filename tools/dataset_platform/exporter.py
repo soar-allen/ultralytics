@@ -74,18 +74,42 @@ def _get_labeled_view(
     return view
 
 
-def _build_class_map(
-    ds: fo.Dataset | fo.DatasetView,
-    label_field: str,
-    classes: Optional[list[str]] = None,
-) -> dict[str, int]:
-    """构建 class_name -> class_id 映射。"""
+def load_class_names_from_yaml(data_yaml: str | Path | None) -> list[str]:
+    """从 YOLO data.yaml 中读取按 class id 排序的类别名。"""
+    if not data_yaml:
+        return []
+    yaml_path = Path(data_yaml)
+    if not yaml_path.exists():
+        return []
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        logger.warning("读取类别顺序失败: %s", yaml_path)
+        return []
+
+    names = data.get("names", {})
+    if isinstance(names, dict):
+        items = []
+        for k, v in names.items():
+            try:
+                items.append((int(k), str(v)))
+            except (TypeError, ValueError):
+                continue
+        return [name for _, name in sorted(items)]
+    if isinstance(names, (list, tuple)):
+        return [str(n) for n in names]
+    return []
+
+
+def _distinct_label_classes(ds: fo.Dataset | fo.DatasetView, label_field: str) -> list[str]:
+    """返回字段中的类别名，按稳定字典序排列。"""
     schema = ds.get_field_schema()
     if label_field not in schema:
-        return {}
+        return []
 
     field = schema[label_field]
-    if hasattr(field, 'document_type') and field.document_type:
+    if hasattr(field, "document_type") and field.document_type:
         if issubclass(field.document_type, fo.Detections):
             raw = ds.distinct(f"{label_field}.detections.label")
         elif issubclass(field.document_type, fo.Keypoints):
@@ -96,13 +120,42 @@ def _build_class_map(
             raw = []
     else:
         raw = []
+    return sorted(c for c in raw if c is not None)
 
-    all_classes = sorted(c for c in raw if c is not None)
 
-    if classes:
-        all_classes = [c for c in all_classes if c in classes]
+def _build_ordered_class_map(
+    discovered_classes: list[str],
+    classes: Optional[list[str]] = None,
+    class_names: Optional[list[str]] = None,
+) -> dict[str, int]:
+    """构建类别映射，可用既有 class_names 锁定旧 class id 并追加新类别。"""
+    export_filter = set(classes or [])
+    discovered = [c for c in discovered_classes if not export_filter or c in export_filter]
 
-    return {name: idx for idx, name in enumerate(all_classes)}
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in class_names or []:
+        if name in seen:
+            continue
+        ordered.append(name)
+        seen.add(name)
+    for name in discovered:
+        if name not in seen:
+            ordered.append(name)
+            seen.add(name)
+
+    return {name: idx for idx, name in enumerate(ordered)}
+
+
+def _build_class_map(
+    ds: fo.Dataset | fo.DatasetView,
+    label_field: str,
+    classes: Optional[list[str]] = None,
+    class_names: Optional[list[str]] = None,
+) -> dict[str, int]:
+    """构建 class_name -> class_id 映射。"""
+    all_classes = _distinct_label_classes(ds, label_field)
+    return _build_ordered_class_map(all_classes, classes=classes, class_names=class_names)
 
 
 def _write_data_yaml(
@@ -191,6 +244,7 @@ def export_yolo_detect(
     label_field: str = "ground_truth",
     classes: Optional[list[str]] = None,
     splits: SplitsType = "train",
+    class_names: Optional[list[str]] = None,
 ) -> dict:
     """
     导出 YOLO Detect 格式（纯框）。
@@ -200,7 +254,7 @@ def export_yolo_detect(
     """
     output_dir = Path(output_dir).resolve()
     view = _get_labeled_view(ds, label_field, classes)
-    class_map = _build_class_map(ds, label_field, classes)
+    class_map = _build_class_map(ds, label_field, classes, class_names=class_names)
 
     if not class_map:
         logger.warning("无可导出的类别")
@@ -270,6 +324,7 @@ def export_yolo_pose(
     classes: Optional[list[str]] = None,
     splits: SplitsType = "train",
     num_keypoints: Optional[int] = None,
+    class_names: Optional[list[str]] = None,
 ) -> dict:
     """
     导出 YOLO Pose 格式（关键点）。
@@ -291,12 +346,8 @@ def export_yolo_pose(
         view = view.filter_labels(kp_field, F("label").is_in(classes))
         view = view.match(F(f"{kp_field}.keypoints").length() > 0)
 
-    class_map = _build_class_map(ds, kp_field, classes)
-    if not class_map:
-        all_kp_classes = sorted(c for c in ds.distinct(f"{kp_field}.keypoints.label") if c is not None)
-        if classes:
-            all_kp_classes = [c for c in all_kp_classes if c in classes]
-        class_map = {name: idx for idx, name in enumerate(all_kp_classes)}
+    all_kp_classes = _distinct_label_classes(ds, kp_field)
+    class_map = _build_ordered_class_map(all_kp_classes, classes=classes, class_names=class_names)
 
     if not class_map:
         return {"exported": 0}
@@ -507,6 +558,7 @@ def export_yolo_pose_from_polylines(
     splits: SplitsType = "train",
     edge_threshold: float = 5.0,
     bbox_margin: float = 0.0,
+    class_names: Optional[list[str]] = None,
 ) -> dict:
     """
     从四边形 Polylines 导出 YOLO Pose 格式。
@@ -534,10 +586,8 @@ def export_yolo_pose_from_polylines(
         view = view.filter_labels(label_field, F("label").is_in(classes))
         view = view.match(F(f"{label_field}.polylines").length() > 0)
 
-    all_classes = sorted(c for c in ds.distinct(f"{label_field}.polylines.label") if c is not None)
-    if classes:
-        all_classes = [c for c in all_classes if c in classes]
-    class_map = {name: idx for idx, name in enumerate(all_classes)}
+    all_classes = _distinct_label_classes(ds, label_field)
+    class_map = _build_ordered_class_map(all_classes, classes=classes, class_names=class_names)
 
     if not class_map:
         logger.warning("无可导出的类别")
@@ -664,6 +714,7 @@ def export_yolo_obb(
     obb_field: Optional[str] = None,
     classes: Optional[list[str]] = None,
     splits: SplitsType = "train",
+    class_names: Optional[list[str]] = None,
 ) -> dict:
     """
     导出 YOLO OBB 格式（旋转框）。
@@ -677,9 +728,9 @@ def export_yolo_obb(
     output_dir = Path(output_dir).resolve()
 
     if obb_field and obb_field in ds.get_field_schema():
-        return _export_obb_from_polylines(ds, output_dir, obb_field, classes, splits)
+        return _export_obb_from_polylines(ds, output_dir, obb_field, classes, splits, class_names)
     else:
-        return _export_obb_from_detections(ds, output_dir, label_field, classes, splits)
+        return _export_obb_from_detections(ds, output_dir, label_field, classes, splits, class_names)
 
 
 export_yolov8_obb = export_yolo_obb
@@ -691,6 +742,7 @@ def _export_obb_from_polylines(
     obb_field: str,
     classes: Optional[list[str]],
     splits: SplitsType,
+    class_names: Optional[list[str]] = None,
 ) -> dict:
     from fiftyone import ViewField as F
     view = ds.match(F(f"{obb_field}.polylines").length() > 0)
@@ -698,10 +750,8 @@ def _export_obb_from_polylines(
         view = view.filter_labels(obb_field, F("label").is_in(classes))
         view = view.match(F(f"{obb_field}.polylines").length() > 0)
 
-    all_classes = sorted(c for c in ds.distinct(f"{obb_field}.polylines.label") if c is not None)
-    if classes:
-        all_classes = [c for c in all_classes if c in classes]
-    class_map = {name: idx for idx, name in enumerate(all_classes)}
+    all_classes = _distinct_label_classes(ds, obb_field)
+    class_map = _build_ordered_class_map(all_classes, classes=classes, class_names=class_names)
 
     if not class_map:
         return {"exported": 0}
@@ -762,10 +812,11 @@ def _export_obb_from_detections(
     label_field: str,
     classes: Optional[list[str]],
     splits: SplitsType,
+    class_names: Optional[list[str]] = None,
 ) -> dict:
     """从 Detections 字段（带 rotation 属性）导出 OBB 格式。"""
     view = _get_labeled_view(ds, label_field, classes)
-    class_map = _build_class_map(ds, label_field, classes)
+    class_map = _build_class_map(ds, label_field, classes, class_names=class_names)
 
     if not class_map:
         return {"exported": 0}

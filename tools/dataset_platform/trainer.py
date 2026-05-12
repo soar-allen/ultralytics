@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import random
 import threading
 import time
 import traceback
@@ -139,7 +140,10 @@ def _expand_train_sources(train, base_dir: Path) -> list[str]:
                 for line in f:
                     p = line.strip()
                     if p:
-                        paths.append(p)
+                        image_path = Path(p)
+                        if not image_path.is_absolute():
+                            image_path = (train_path.parent / image_path).resolve()
+                        paths.append(str(image_path))
         except OSError:
             return []
         return paths
@@ -313,6 +317,116 @@ def _build_balanced_data_yaml(
     return str(yaml_path), info
 
 
+def _read_label_class_ids(image_path: str | Path) -> set[int]:
+    label_path = _label_path_from_image(image_path)
+    class_ids: set[int] = set()
+    if not label_path.exists():
+        return class_ids
+    try:
+        with open(label_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                try:
+                    class_ids.add(int(float(parts[0])))
+                except ValueError:
+                    continue
+    except OSError:
+        return set()
+    return class_ids
+
+
+def _build_incremental_replay_data_yaml(
+    data_yaml: str | Path,
+    new_classes: list[str],
+    old_replay_per_class: int = 200,
+    seed: int = 42,
+) -> tuple[str, dict | None]:
+    """构造增量训练 data.yaml：新类全量 + 旧类代表样本回放。"""
+    data_yaml = str(data_yaml)
+    data = _load_data_yaml(data_yaml)
+    names_map = _names_to_id_map(data.get("names", {}))
+    name_to_id = {v: k for k, v in names_map.items()}
+    new_ids = {name_to_id[n] for n in new_classes if n in name_to_id}
+    if not new_ids:
+        return data_yaml, None
+
+    train_sources = data.get("train")
+    if not train_sources:
+        return data_yaml, None
+
+    base_dir = Path(data_yaml).parent
+    image_paths = _expand_train_sources(train_sources, base_dir)
+    if not image_paths:
+        return data_yaml, None
+
+    old_ids = {cid for cid in names_map if cid not in new_ids}
+    new_images: list[str] = []
+    old_candidates: dict[int, list[str]] = {cid: [] for cid in old_ids}
+    class_counts = {name: 0 for name in names_map.values()}
+
+    for img in image_paths:
+        img_class_ids = _read_label_class_ids(img)
+        if not img_class_ids:
+            continue
+        for cid in img_class_ids:
+            if cid in names_map:
+                class_counts[names_map[cid]] = class_counts.get(names_map[cid], 0) + 1
+        if img_class_ids & new_ids:
+            new_images.append(img)
+            continue
+        for cid in img_class_ids & old_ids:
+            old_candidates.setdefault(cid, []).append(img)
+
+    if not new_images:
+        return data_yaml, None
+
+    rng = random.Random(seed)
+    replay_images: list[str] = []
+    replay_counts: dict[str, int] = {}
+    for cid in sorted(old_candidates):
+        candidates = sorted(set(old_candidates[cid]))
+        if not candidates:
+            replay_counts[names_map[cid]] = 0
+            continue
+        take = min(int(old_replay_per_class), len(candidates))
+        selected = rng.sample(candidates, take) if take < len(candidates) else candidates
+        replay_images.extend(selected)
+        replay_counts[names_map[cid]] = len(selected)
+
+    if old_ids and not replay_images:
+        return data_yaml, None
+
+    train_list = sorted(set(new_images + replay_images))
+    tmp_dir = Path.home() / ".dataset_platform" / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    list_path = tmp_dir / f"train_incremental_replay_{ts}.txt"
+    yaml_path = tmp_dir / f"data_incremental_replay_{ts}.yaml"
+
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(train_list))
+
+    data["train"] = str(list_path)
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+    new_class_names = [names_map[cid] for cid in sorted(new_ids)]
+    info = {
+        "new_classes": new_class_names,
+        "new_images": len(set(new_images)),
+        "old_replay_per_class": int(old_replay_per_class),
+        "old_replay_counts": replay_counts,
+        "train_images": len(train_list),
+        "train_list": str(list_path),
+        "source_data_yaml": data_yaml,
+        "seed": int(seed),
+        "class_counts_in_source_train": class_counts,
+    }
+    return str(yaml_path), info
+
+
 def start_training(
     data_yaml: str,
     model_path: str = "yolo11n.pt",
@@ -392,7 +506,13 @@ def start_training(
             balance_target_ratio = 0.5
             balance_max_repeat = 3
             balance_pure_minority_only = False
+            incremental_classes = []
+            incremental_old_replay_per_class = 200
+            incremental_seed = 42
             if extra_args:
+                incremental_classes = extra_args.pop("incremental_new_classes", []) or []
+                incremental_old_replay_per_class = extra_args.pop("incremental_old_replay_per_class", 200)
+                incremental_seed = extra_args.pop("incremental_seed", 42)
                 balance_classes = extra_args.pop("balance_classes", []) or []
                 balance_reference_classes = extra_args.pop("balance_reference_classes", []) or []
                 balance_target_ratio = extra_args.pop("balance_target_ratio", 0.5)
@@ -400,6 +520,26 @@ def start_training(
                 balance_pure_minority_only = extra_args.pop("balance_pure_minority_only", False)
 
             data_yaml_path = data_yaml
+            incremental_info = None
+            if incremental_classes:
+                data_yaml_path, incremental_info = _build_incremental_replay_data_yaml(
+                    data_yaml_path,
+                    new_classes=incremental_classes,
+                    old_replay_per_class=int(incremental_old_replay_per_class),
+                    seed=int(incremental_seed),
+                )
+                if incremental_info:
+                    _training_status["progress"] = (
+                        "已启用增量训练回放: 新类图片 "
+                        f"{incremental_info['new_images']} 张, "
+                        f"训练图片 {incremental_info['train_images']} 张"
+                    )
+                else:
+                    raise ValueError(
+                        "增量训练回放未生成训练清单，请检查新增类别名称是否存在于 data.yaml，"
+                        "train split 中是否包含新增类别标注，以及是否包含可回放的旧类别样本"
+                    )
+
             balance_info = None
             if balance_classes:
                 data_yaml_path, balance_info = _build_balanced_data_yaml(
@@ -456,6 +596,7 @@ def start_training(
                 "duration_seconds": round(duration, 1),
                 "data_yaml": data_yaml,
                 "train_data_yaml": data_yaml_path,
+                "incremental_info": incremental_info,
                 "balance_info": balance_info,
                 "model": model_path,
                 "task": task,

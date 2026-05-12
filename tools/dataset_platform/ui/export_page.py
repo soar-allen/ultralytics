@@ -55,6 +55,8 @@ def _render_export():
     edge_threshold = 5.0
     bbox_margin = 0.0
     obb_field = ""
+    class_order_yaml = ""
+    locked_class_names: list[str] = []
     can_export = True
 
     if not is_images_only:
@@ -89,6 +91,20 @@ def _render_export():
         all_classes = dm.get_label_classes(ds, label_field)
         if all_classes:
             selected_classes = st.multiselect("选择导出类别（留空导出全部）", all_classes, key="export_classes")
+
+        with st.expander("🔒 类别顺序锁定（增量训练推荐）", expanded=False):
+            st.caption("选择上一版 data.yaml 后，旧类别 class id 保持不变，新类别追加到末尾。")
+            class_order_yaml = _path_browser(
+                "上一版 data.yaml", "export_class_order_yaml", mode="file",
+                file_extensions=(".yaml", ".yml"),
+                start_dir=CONFIG.default_export_dir,
+            )
+            if class_order_yaml:
+                locked_class_names = exporter.load_class_names_from_yaml(class_order_yaml)
+                if locked_class_names:
+                    st.success(f"已读取 {len(locked_class_names)} 个旧类别: {', '.join(locked_class_names)}")
+                else:
+                    st.warning("未能从该 YAML 读取类别顺序，将使用当前导出类别顺序")
 
         if format_choice == "YOLO Pose (关键点)":
             kp_field = st.text_input("关键点字段名", value=f"{label_field}_keypoints", key="export_kp_field")
@@ -136,20 +152,24 @@ def _render_export():
                 if format_choice == "YOLO Detect (纯框)":
                     result = exporter.export_yolo_detect(
                         export_view, output_dir, label_field=label_field, classes=classes, splits=splits,
+                        class_names=locked_class_names or None,
                     )
                 elif format_choice == "YOLO Pose (关键点)":
                     result = exporter.export_yolo_pose(
                         export_view, output_dir, det_field=label_field, kp_field=kp_field, classes=classes, splits=splits,
+                        class_names=locked_class_names or None,
                     )
                 elif format_choice == "YOLO Pose (四边形转关键点)":
                     result = exporter.export_yolo_pose_from_polylines(
                         export_view, output_dir, label_field=label_field, classes=classes, splits=splits,
                         edge_threshold=edge_threshold, bbox_margin=bbox_margin,
+                        class_names=locked_class_names or None,
                     )
                 elif format_choice == "YOLO OBB (旋转框)":
                     result = exporter.export_yolo_obb(
                         export_view, output_dir, label_field=label_field,
                         obb_field=obb_field if obb_field else None, classes=classes, splits=splits,
+                        class_names=locked_class_names or None,
                     )
                 else:
                     result = {}
@@ -170,6 +190,8 @@ def _render_export():
                     "data_yaml": data_yaml,
                     "label_field": label_field,
                     "classes": classes,
+                    "class_order_yaml": class_order_yaml or None,
+                    "locked_class_names": locked_class_names or None,
                     "splits": str(splits),
                     "tags_filter": selected_tags or None,
                     "num_samples": result.get("total_samples", len(export_view)),

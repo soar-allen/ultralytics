@@ -8,6 +8,7 @@ from pathlib import Path
 import streamlit as st
 
 from tools.dataset_platform import data_manager as dm
+from tools.dataset_platform import exporter
 from tools.dataset_platform import trainer
 from tools.dataset_platform.config import CONFIG
 from tools.dataset_platform.ui.components import _get_ds, _path_browser
@@ -152,6 +153,64 @@ def _render_train_config(ds):
             placeholder="留空则自动命名",
             help="本次训练的子目录名，方便区分不同实验",
         )
+
+    st.markdown("---")
+
+    # ═══════════════════ 增量训练 / 旧类回放 ═══════════════════
+    class_names = exporter.load_class_names_from_yaml(data_yaml) if data_yaml and Path(data_yaml).exists() else []
+    with st.expander("🧩 增量训练 / 旧类回放", expanded=False):
+        st.caption("用于新增托盘类别：新类图片全量训练，并从旧类别中抽样回放，降低遗忘风险。")
+        incremental_enable = st.checkbox(
+            "启用增量训练回放",
+            value=False,
+            key="train_incremental_enable",
+        )
+        if class_names:
+            incremental_new_classes = st.multiselect(
+                "新增类别",
+                class_names,
+                default=[],
+                key="train_incremental_new_classes",
+                help="这些类别对应的训练图片会全部进入 train 清单；其他类别按每类上限抽样回放。",
+                disabled=not incremental_enable,
+            )
+        else:
+            raw_new_classes = st.text_input(
+                "新增类别（逗号分隔）",
+                value="",
+                key="train_incremental_new_classes_text",
+                help="未能读取 data.yaml 的 names 时手动输入。",
+                disabled=not incremental_enable,
+            )
+            incremental_new_classes = [c.strip() for c in raw_new_classes.split(",") if c.strip()]
+
+        col_inc1, col_inc2, col_inc3 = st.columns(3)
+        with col_inc1:
+            incremental_old_replay_per_class = st.number_input(
+                "每个旧类回放图片上限",
+                1, 5000, 200, 10,
+                key="train_incremental_old_replay_per_class",
+                disabled=not incremental_enable,
+            )
+        with col_inc2:
+            incremental_seed = st.number_input(
+                "抽样种子",
+                0, 999999, 42, 1,
+                key="train_incremental_seed",
+                disabled=not incremental_enable,
+            )
+        with col_inc3:
+            incremental_auto_balance = st.checkbox(
+                "新类自动重采样",
+                value=True,
+                key="train_incremental_auto_balance",
+                help="未手动启用少数类重采样时，自动把新增类别作为少数类重采样。",
+                disabled=not incremental_enable,
+            )
+        if incremental_enable:
+            if class_names:
+                st.info(f"data.yaml 当前类别顺序: {', '.join(class_names)}")
+            st.warning("请确认本次 data.yaml 已用上一版类别顺序锁定导出，否则旧模型的 class id 可能不一致。")
 
     st.markdown("---")
 
@@ -304,6 +363,9 @@ def _render_train_config(ds):
         if not model_path:
             st.error("请指定模型路径")
             return
+        if incremental_enable and not incremental_new_classes:
+            st.error("启用增量训练回放时，请至少选择一个新增类别")
+            return
 
         extra_args = {
             "lr0": lr0, "lrf": lrf, "momentum": momentum,
@@ -326,6 +388,16 @@ def _render_train_config(ds):
             extra_args["balance_target_ratio"] = float(balance_ratio)
             extra_args["balance_max_repeat"] = int(balance_max_repeat)
             extra_args["balance_pure_minority_only"] = bool(balance_pure_minority_only)
+        if incremental_enable:
+            extra_args["incremental_new_classes"] = incremental_new_classes
+            extra_args["incremental_old_replay_per_class"] = int(incremental_old_replay_per_class)
+            extra_args["incremental_seed"] = int(incremental_seed)
+            if incremental_auto_balance and not balance_enable:
+                extra_args["balance_classes"] = incremental_new_classes
+                extra_args["balance_reference_classes"] = []
+                extra_args["balance_target_ratio"] = 0.8
+                extra_args["balance_max_repeat"] = 3
+                extra_args["balance_pure_minority_only"] = False
 
         result = trainer.start_training(
             data_yaml=data_yaml,
@@ -479,6 +551,10 @@ def _render_progress_and_history(ds):
                 "Epochs": h.get("epochs", ""),
                 "ImgSz": h.get("imgsz", ""),
             }
+            inc = h.get("incremental_info") or {}
+            if inc:
+                row["增量新类"] = ", ".join(inc.get("new_classes", []))
+                row["回放训练图"] = inc.get("train_images", "")
             mAP50 = metrics.get("metrics/mAP50(B)") or metrics.get("mAP50(B)")
             mAP50_95 = metrics.get("metrics/mAP50-95(B)") or metrics.get("mAP50-95(B)")
             if mAP50 is not None:
