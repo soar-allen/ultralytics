@@ -199,7 +199,7 @@ def _render_train_config(ds):
 
     # ═══════════════════ 组合增强 ═══════════════════
     with st.expander("🧩 组合增强", expanded=False):
-        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
             mosaic = st.slider("mosaic", 0.0, 1.0, 1.0, 0.1, key="train_mosaic")
         with col_m2:
@@ -207,10 +207,19 @@ def _render_train_config(ds):
                                            key="train_close_mosaic")
         with col_m3:
             mixup = st.slider("mixup", 0.0, 1.0, 0.0, 0.1, key="train_mixup")
+        with col_m4:
+            cutmix = st.slider(
+                "cutmix", 0.0, 1.0, 0.0, 0.05, key="train_cutmix",
+                help="检测任务可用的混合增强。类别不均衡时可小幅开启，如 0.05~0.15。",
+            )
+        multi_scale = st.slider(
+            "multi_scale (多尺度训练概率)", 0.0, 1.0, 0.0, 0.1, key="train_multi_scale",
+            help="随机改变训练尺寸提升泛化。小目标/尺度变化大时可尝试 0.3~0.5。",
+        )
 
     # ═══════════════════ 损失函数与类别平衡 ═══════════════════
     with st.expander("⚖️ 损失函数与类别平衡", expanded=False):
-        st.caption("类别不平衡时，可提高 cls 权重，并启用少数类重采样以缓解偏差")
+        st.caption("类别不平衡时，优先启用少数类重采样；再适度提高 cls 权重")
         col_bal, col_cls, col_box, col_dfl = st.columns(4)
         with col_bal:
             balance_enable = st.checkbox("少数类重采样", value=False, key="train_balance_enable")
@@ -218,18 +227,26 @@ def _render_train_config(ds):
                 "少数类名称(逗号分隔)", value="tian", key="train_balance_names",
                 help="仅用于训练前构造重采样列表，不影响标注",
             )
+            balance_reference_names = st.text_input(
+                "参考多数类(逗号分隔)", value="chuan", key="train_balance_reference_names",
+                help="例如 chuan。留空时使用所有非少数类作为参考。",
+            )
             balance_ratio = st.number_input(
                 "目标比例(少/多)", 0.1, 1.0, 0.5, 0.1, key="train_balance_ratio",
-                help="重采样后的目标比例，建议 0.3~0.7",
+                help="重采样后少数类实例数 / 参考多数类实例数，建议从 0.5~0.8 开始",
             )
             balance_max_repeat = st.number_input(
                 "最大重复倍数", 1, 10, 3, 1, key="train_balance_max_repeat",
                 help="少数类样本最多重复次数",
             )
+            balance_pure_minority_only = st.checkbox(
+                "只重采样纯少数类图片", value=True, key="train_balance_pure_minority_only",
+                help="启用后只重复标注文件中不含参考多数类/其他类别的少数类图片，避免重复 tian 时同时增加 chuan。",
+            )
         with col_cls:
             cls_weight = st.number_input(
-                "cls (分类损失权重)", 0.0, 10.0, 0.5, 0.1, key="train_cls",
-                help="默认 0.5。类别不平衡时可提高到 1.0~2.0",
+                "cls (分类损失权重)", 0.0, 10.0, 0.8, 0.1, key="train_cls",
+                help="默认 0.5。chuan/tian 易混淆或 tian 召回低时可提高到 0.8~1.5。",
             )
         with col_box:
             box_weight = st.number_input(
@@ -244,10 +261,15 @@ def _render_train_config(ds):
 
     # ═══════════════════ 优化器与学习率 ═══════════════════
     with st.expander("📈 优化器与学习率", expanded=False):
-        col_lr, col_wd, col_opt = st.columns(3)
+        col_lr, col_lrf, col_wd, col_opt = st.columns(4)
         with col_lr:
             lr0 = st.number_input("初始学习率 (lr0)", 0.0001, 1.0, 0.01, 0.001,
                                   format="%.4f", key="train_lr0")
+        with col_lrf:
+            lrf = st.number_input(
+                "最终学习率比例 (lrf)", 0.001, 1.0, 0.01, 0.001,
+                format="%.3f", key="train_lrf",
+            )
         with col_wd:
             weight_decay = st.number_input("权重衰减", 0.0, 0.1, 0.0005, 0.0001,
                                            format="%.4f", key="train_wd")
@@ -261,6 +283,16 @@ def _render_train_config(ds):
         with col_pat:
             patience = st.number_input("早停耐心值 (patience)", 0, 500, 100, key="train_patience",
                                        help="默认 100。类别不平衡时建议设为 50~100，给模型更多学习少数类的机会")
+        col_mom, col_warm, col_warm_mom = st.columns(3)
+        with col_mom:
+            momentum = st.number_input("momentum", 0.0, 1.0, 0.937, 0.001,
+                                       format="%.3f", key="train_momentum")
+        with col_warm:
+            warmup_epochs = st.number_input("warmup_epochs", 0.0, 10.0, 3.0, 0.5,
+                                            key="train_warmup_epochs")
+        with col_warm_mom:
+            warmup_momentum = st.number_input("warmup_momentum", 0.0, 1.0, 0.8, 0.05,
+                                              key="train_warmup_momentum")
 
     st.markdown("---")
 
@@ -274,20 +306,26 @@ def _render_train_config(ds):
             return
 
         extra_args = {
-            "lr0": lr0, "weight_decay": weight_decay, "optimizer": optimizer,
+            "lr0": lr0, "lrf": lrf, "momentum": momentum,
+            "weight_decay": weight_decay, "optimizer": optimizer,
             "cos_lr": cos_lr, "patience": patience,
+            "warmup_epochs": warmup_epochs, "warmup_momentum": warmup_momentum,
             "cls": cls_weight, "box": box_weight, "dfl": dfl_weight,
             "hsv_h": hsv_h, "hsv_s": hsv_s, "hsv_v": hsv_v,
             "degrees": degrees, "translate": translate, "scale": scale,
             "shear": shear, "perspective": perspective,
             "fliplr": fliplr, "flipud": flipud,
             "mosaic": mosaic, "close_mosaic": close_mosaic, "mixup": mixup,
+            "cutmix": cutmix, "multi_scale": multi_scale,
         }
         if balance_enable:
             names = [n.strip() for n in balance_names.split(",") if n.strip()]
+            reference_names = [n.strip() for n in balance_reference_names.split(",") if n.strip()]
             extra_args["balance_classes"] = names
+            extra_args["balance_reference_classes"] = reference_names
             extra_args["balance_target_ratio"] = float(balance_ratio)
             extra_args["balance_max_repeat"] = int(balance_max_repeat)
+            extra_args["balance_pure_minority_only"] = bool(balance_pure_minority_only)
 
         result = trainer.start_training(
             data_yaml=data_yaml,

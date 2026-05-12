@@ -170,6 +170,8 @@ def _build_balanced_data_yaml(
     balance_classes: list[str],
     target_ratio: float,
     max_repeat: int,
+    reference_classes: Optional[list[str]] = None,
+    pure_minority_only: bool = False,
 ) -> tuple[str, dict | None]:
     data_yaml = str(data_yaml)
     data = _load_data_yaml(data_yaml)
@@ -178,6 +180,7 @@ def _build_balanced_data_yaml(
     class_ids = [name_to_id[n] for n in balance_classes if n in name_to_id]
     if not class_ids:
         return data_yaml, None
+    reference_ids = [name_to_id[n] for n in (reference_classes or []) if n in name_to_id]
 
     base_dir = Path(data_yaml).parent
     train_sources = data.get("train")
@@ -189,10 +192,12 @@ def _build_balanced_data_yaml(
         return data_yaml, None
 
     class_counts = {cid: 0 for cid in class_ids}
-    image_has_minority: dict[str, bool] = {}
+    image_repeatable: dict[str, bool] = {}
+    image_class_ids: dict[str, set[int]] = {}
     for img in image_paths:
         label_path = _label_path_from_image(img)
         has_minority = False
+        img_class_ids = set()
         if label_path.exists():
             try:
                 with open(label_path, "r", encoding="utf-8") as f:
@@ -204,12 +209,16 @@ def _build_balanced_data_yaml(
                             cls_id = int(float(parts[0]))
                         except ValueError:
                             continue
+                        img_class_ids.add(cls_id)
                         if cls_id in class_counts:
                             class_counts[cls_id] += 1
                             has_minority = True
             except OSError:
                 pass
-        image_has_minority[img] = has_minority
+        image_class_ids[img] = img_class_ids
+        image_repeatable[img] = has_minority and (
+            not pure_minority_only or img_class_ids.issubset(set(class_ids))
+        )
 
     minority_total = sum(class_counts.values())
     if minority_total <= 0:
@@ -230,7 +239,10 @@ def _build_balanced_data_yaml(
                         cls_id = int(float(parts[0]))
                     except ValueError:
                         continue
-                    if cls_id not in class_counts:
+                    if reference_ids:
+                        if cls_id in reference_ids:
+                            majority_total += 1
+                    elif cls_id not in class_counts:
                         majority_total += 1
         except OSError:
             pass
@@ -238,15 +250,41 @@ def _build_balanced_data_yaml(
     if majority_total <= 0:
         return data_yaml, None
 
+    repeatable_minority_total = 0
+    for img, can_repeat in image_repeatable.items():
+        if not can_repeat:
+            continue
+        label_path = _label_path_from_image(img)
+        if not label_path.exists():
+            continue
+        try:
+            with open(label_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    try:
+                        cls_id = int(float(parts[0]))
+                    except ValueError:
+                        continue
+                    if cls_id in class_counts:
+                        repeatable_minority_total += 1
+        except OSError:
+            pass
+
+    if repeatable_minority_total <= 0:
+        return data_yaml, None
+
     desired_minor = max(1, int(majority_total * float(target_ratio)))
-    repeat = min(max_repeat, max(1, math.ceil(desired_minor / minority_total)))
+    extra_needed = max(0, desired_minor - minority_total)
+    repeat = min(max_repeat, max(1, math.ceil(extra_needed / repeatable_minority_total) + 1))
     if repeat <= 1:
         return data_yaml, None
 
     balanced_list: list[str] = []
     for img in image_paths:
         balanced_list.append(img)
-        if image_has_minority.get(img):
+        if image_repeatable.get(img):
             balanced_list.extend([img] * (repeat - 1))
 
     tmp_dir = Path.home() / ".dataset_platform" / "tmp"
@@ -265,8 +303,12 @@ def _build_balanced_data_yaml(
     info = {
         "minority_total": minority_total,
         "majority_total": majority_total,
+        "repeatable_minority_total": repeatable_minority_total,
+        "desired_minority_total": desired_minor,
         "repeat": repeat,
         "train_list": str(list_path),
+        "reference_classes": reference_classes or [],
+        "pure_minority_only": pure_minority_only,
     }
     return str(yaml_path), info
 
@@ -346,12 +388,16 @@ def start_training(
             model.add_callback("on_fit_epoch_end", _epoch_end_callback)
 
             balance_classes = []
+            balance_reference_classes = []
             balance_target_ratio = 0.5
             balance_max_repeat = 3
+            balance_pure_minority_only = False
             if extra_args:
                 balance_classes = extra_args.pop("balance_classes", []) or []
+                balance_reference_classes = extra_args.pop("balance_reference_classes", []) or []
                 balance_target_ratio = extra_args.pop("balance_target_ratio", 0.5)
                 balance_max_repeat = extra_args.pop("balance_max_repeat", 3)
+                balance_pure_minority_only = extra_args.pop("balance_pure_minority_only", False)
 
             data_yaml_path = data_yaml
             balance_info = None
@@ -361,6 +407,8 @@ def start_training(
                     balance_classes=balance_classes,
                     target_ratio=float(balance_target_ratio),
                     max_repeat=int(balance_max_repeat),
+                    reference_classes=balance_reference_classes,
+                    pure_minority_only=bool(balance_pure_minority_only),
                 )
                 if balance_info:
                     _training_status["progress"] = (
@@ -407,6 +455,8 @@ def start_training(
                 "end_time": datetime.fromtimestamp(t_end).isoformat(),
                 "duration_seconds": round(duration, 1),
                 "data_yaml": data_yaml,
+                "train_data_yaml": data_yaml_path,
+                "balance_info": balance_info,
                 "model": model_path,
                 "task": task,
                 "epochs": epochs,
