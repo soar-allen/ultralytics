@@ -9,6 +9,24 @@ from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform.ui.components import _get_ds, _get_info
 
 
+def _get_label_items(labels) -> list:
+    """Return contained label items for common FiftyOne label containers."""
+    if labels is None:
+        return []
+    return (
+        getattr(labels, "detections", None)
+        or getattr(labels, "polylines", None)
+        or getattr(labels, "keypoints", None)
+        or getattr(labels, "classifications", None)
+        or []
+    )
+
+
+def _get_sample_classes(sample, label_field: str) -> set[str]:
+    labels = sample.get_field(label_field)
+    return {item.label for item in _get_label_items(labels) if hasattr(item, "label")}
+
+
 def _render_quality_page():
     st.header("🔬 标注质量检查")
     ds = _get_ds()
@@ -54,7 +72,7 @@ def _render_class_balance(ds, label_field: str):
         labels = sample.get_field(label_field)
         if labels is None:
             continue
-        items = getattr(labels, "detections", None) or getattr(labels, "polylines", None) or []
+        items = _get_label_items(labels)
         for item in items:
             cls = item.label if hasattr(item, "label") else str(item)
             class_counts[cls] = class_counts.get(cls, 0) + 1
@@ -139,9 +157,29 @@ def _render_class_balance(ds, label_field: str):
         help="增强后的样本多样性更好，训练效果更佳",
     )
 
+    st.markdown("#### 源样本限制")
+    only_pure_source = st.checkbox(
+        "仅使用采样字段中只含指定类别的图片",
+        value=False,
+        key="qa_oversample_only_pure_source",
+        help="启用后，候选源图片在当前标签字段中不能包含未选中的其他类别。例如选择 tian 时，只复制字段中仅含 tian 标注的图片。",
+    )
+    default_pure_classes = ["tian"] if "tian" in all_classes else []
+    pure_source_classes = st.multiselect(
+        "源图片允许包含的类别",
+        all_classes,
+        default=default_pure_classes,
+        key="qa_oversample_pure_source_classes",
+        disabled=not only_pure_source,
+        help="可选一个或多个类别。启用限制后，源图片的类别集合必须是这里所选类别的非空子集。",
+    )
+
     if st.button("🚀 执行过采样", key="btn_oversample", type="primary"):
         if not selected_minority:
             st.error("请至少选择一个类别")
+            return
+        if only_pure_source and not pure_source_classes:
+            st.error("启用源样本限制时，请至少选择一个允许类别")
             return
 
         import random
@@ -160,17 +198,41 @@ def _render_class_balance(ds, label_field: str):
         class_added = {}
 
         cls_sample_map: dict[str, list] = {cls: [] for cls in selected_minority}
+        pure_source_set = set(pure_source_classes)
         for sample in ds.iter_samples():
-            labels = sample.get_field(label_field)
-            if labels is None:
+            sample_classes = _get_sample_classes(sample, label_field)
+            if not sample_classes:
                 continue
-            items = getattr(labels, "detections", None) or getattr(labels, "polylines", None) or []
-            sample_classes = {item.label for item in items if hasattr(item, "label")}
+            if only_pure_source and not sample_classes.issubset(pure_source_set):
+                continue
             for cls in selected_minority:
                 if cls in sample_classes:
                     cls_sample_map[cls].append(sample)
 
-        total_ops = sum(max(0, target_count - class_counts[cls]) for cls in selected_minority)
+        requested_ops = sum(max(0, target_count - class_counts[cls]) for cls in selected_minority)
+        if requested_ops == 0:
+            st.info("所选类别已达到目标数量，无需新增样本")
+            return
+
+        missing_sources = [
+            cls for cls in selected_minority
+            if class_counts[cls] < target_count and not cls_sample_map[cls]
+        ]
+        if missing_sources:
+            st.warning(
+                "以下类别没有符合当前源样本限制的图片，将不会新增："
+                + "、".join(f"`{cls}`" for cls in missing_sources)
+            )
+
+        total_ops = sum(
+            max(0, target_count - class_counts[cls])
+            for cls in selected_minority
+            if cls_sample_map[cls]
+        )
+        if total_ops == 0:
+            st.error("没有符合当前条件的源图片，无法执行过采样")
+            return
+
         done_ops = 0
 
         for cls in selected_minority:
