@@ -27,6 +27,66 @@ def _get_sample_classes(sample, label_field: str) -> set[str]:
     return {item.label for item in _get_label_items(labels) if hasattr(item, "label")}
 
 
+def _flip_point(point, hflip: bool, vflip: bool):
+    coords = list(point)
+    if len(coords) < 2:
+        return point
+    if hflip:
+        coords[0] = 1.0 - coords[0]
+    if vflip:
+        coords[1] = 1.0 - coords[1]
+    return tuple(coords) if isinstance(point, tuple) else coords
+
+
+def _flip_ordered_quad(points: list, hflip: bool, vflip: bool) -> list:
+    flipped = [_flip_point(point, hflip, vflip) for point in points]
+    if len(flipped) != 4:
+        return flipped
+    if hflip and vflip:
+        order = [2, 3, 0, 1]
+    elif hflip:
+        order = [1, 0, 3, 2]
+    elif vflip:
+        order = [3, 2, 1, 0]
+    else:
+        order = [0, 1, 2, 3]
+    return [flipped[i] for i in order]
+
+
+def _transform_labels_for_flip(labels, hflip: bool, vflip: bool):
+    if labels is None:
+        return None
+
+    labels = labels.copy()
+    if not hflip and not vflip:
+        return labels
+
+    for det in getattr(labels, "detections", None) or []:
+        bbox = getattr(det, "bounding_box", None)
+        if bbox and len(bbox) >= 4:
+            x, y, w, h = bbox[:4]
+            if hflip:
+                x = 1.0 - x - w
+            if vflip:
+                y = 1.0 - y - h
+            det.bounding_box = [max(0.0, min(1.0, x)), max(0.0, min(1.0, y)), w, h]
+
+    for poly in getattr(labels, "polylines", None) or []:
+        points = getattr(poly, "points", None)
+        if points:
+            poly.points = [
+                _flip_ordered_quad(shape, hflip, vflip)
+                for shape in points
+            ]
+
+    for keypoint in getattr(labels, "keypoints", None) or []:
+        points = getattr(keypoint, "points", None)
+        if points:
+            keypoint.points = _flip_ordered_quad(points, hflip, vflip)
+
+    return labels
+
+
 def _render_quality_page():
     st.header("🔬 标注质量检查")
     ds = _get_ds()
@@ -261,11 +321,15 @@ def _render_class_balance(ds, label_field: str):
 
                 if use_augment and has_cv2:
                     img = cv2.imread(str(src_path))
+                    hflip = False
+                    vflip = False
                     if img is not None:
                         if random.random() > 0.5:
                             img = cv2.flip(img, 1)
+                            hflip = True
                         if random.random() > 0.5:
                             img = cv2.flip(img, 0)
+                            vflip = True
                         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
                         hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-10, 10)) % 180
                         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.8, 1.2), 0, 255)
@@ -274,8 +338,12 @@ def _render_class_balance(ds, label_field: str):
                         cv2.imwrite(str(new_path), img)
                     else:
                         shutil.copy2(src_path, new_path)
+                        hflip = False
+                        vflip = False
                 else:
                     shutil.copy2(src_path, new_path)
+                    hflip = False
+                    vflip = False
 
                 new_sample = fo.Sample(filepath=str(new_path))
                 new_sample.tags.append("oversampled")
@@ -283,7 +351,7 @@ def _render_class_balance(ds, label_field: str):
 
                 src_labels = src.get_field(label_field)
                 if src_labels is not None:
-                    new_sample[label_field] = src_labels.copy()
+                    new_sample[label_field] = _transform_labels_for_flip(src_labels, hflip, vflip)
 
                 for field_name in src.field_names:
                     if field_name in ("id", "filepath", "tags", "metadata", label_field):
