@@ -96,6 +96,7 @@ tools/dataset_platform/
 | ------------------- | ----------------------------------- |
 | YOLO Detect         | class_id cx cy w h                  |
 | YOLO Pose           | class_id cx cy w h kx1 ky1 kv1 ...  |
+| YOLO 混合训练（pose） | Pose 目标正常写关键点，检测类写 bbox + 全 0 关键点 |
 | YOLO Pose (四边形转关键点) | 4点polygon → tl/tr/br/bl 关键点 + 边界可见性 |
 | YOLO OBB            | class_id x1 y1 x2 y2 x3 y3 x4 y4    |
 

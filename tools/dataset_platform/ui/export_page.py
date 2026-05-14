@@ -21,7 +21,14 @@ def _render_export():
 
     format_choice = st.selectbox(
         "导出格式",
-        ["YOLO Detect (纯框)", "YOLO Pose (关键点)", "YOLO Pose (四边形转关键点)", "YOLO OBB (旋转框)", "📷 纯图片"],
+        [
+            "YOLO Detect (纯框)",
+            "YOLO Pose (关键点)",
+            "YOLO 混合训练（pose）",
+            "YOLO Pose (四边形转关键点)",
+            "YOLO OBB (旋转框)",
+            "📷 纯图片",
+        ],
         key="export_format",
     )
 
@@ -29,6 +36,8 @@ def _render_export():
 
     if format_choice == "YOLO Pose (四边形转关键点)":
         st.info("将 4 点多边形 (Polylines) 自动转换为 YOLO Pose 格式")
+    if format_choice == "YOLO 混合训练（pose）":
+        st.info("将关键点目标按 Pose 导出，并将指定检测类别写成 bbox + 全 0 关键点，用于 YOLO task=pose 训练")
     if is_images_only:
         st.info("仅导出图片文件，不包含标签和 data.yaml，不进行数据划分")
 
@@ -52,6 +61,8 @@ def _render_export():
     label_field = "ground_truth"
     selected_classes: list[str] = []
     kp_field = ""
+    mixed_detection_classes: list[str] = []
+    mixed_num_keypoints = 4
     edge_threshold = 5.0
     bbox_margin = 0.0
     obb_field = ""
@@ -89,7 +100,7 @@ def _render_export():
         label_field = st.selectbox("标签字段", info.get("label_fields", ["ground_truth"]), key="export_label_field")
 
         all_classes = dm.get_label_classes(ds, label_field)
-        if all_classes:
+        if all_classes and format_choice != "YOLO 混合训练（pose）":
             selected_classes = st.multiselect("选择导出类别（留空导出全部）", all_classes, key="export_classes")
 
         with st.expander("🔒 类别顺序锁定（增量训练推荐）", expanded=False):
@@ -108,6 +119,32 @@ def _render_export():
 
         if format_choice == "YOLO Pose (关键点)":
             kp_field = st.text_input("关键点字段名", value=f"{label_field}_keypoints", key="export_kp_field")
+
+        if format_choice == "YOLO 混合训练（pose）":
+            st.markdown("**混合训练参数**")
+            kp_field = st.text_input("关键点字段名", value=f"{label_field}_keypoints", key="export_mixed_kp_field")
+            det_text = st.text_input(
+                "只检测类别（逗号分隔）",
+                value="pallet",
+                key="export_mixed_detection_classes",
+                help="这些类别会使用检测框导出，关键点全部写为 0。例如 pallet。",
+            )
+            mixed_detection_classes = [c.strip() for c in det_text.split(",") if c.strip()]
+            mixed_num_keypoints = st.number_input(
+                "关键点数量兜底值",
+                1, 64, 4, 1,
+                key="export_mixed_num_keypoints",
+                help="优先从关键点字段自动推断；当字段中暂时没有关键点时使用该值。",
+            )
+            pose_classes = dm.get_label_classes(ds, kp_field) if kp_field else []
+            det_classes = [c for c in all_classes if not mixed_detection_classes or c in mixed_detection_classes]
+            combined_classes = sorted(set(pose_classes + det_classes))
+            if combined_classes:
+                selected_classes = st.multiselect(
+                    "选择导出类别（留空导出全部）",
+                    combined_classes,
+                    key="export_mixed_classes",
+                )
 
         if format_choice == "YOLO Pose (四边形转关键点)":
             st.markdown("**可见性参数**")
@@ -159,6 +196,18 @@ def _render_export():
                         export_view, output_dir, det_field=label_field, kp_field=kp_field, classes=classes, splits=splits,
                         class_names=locked_class_names or None,
                     )
+                elif format_choice == "YOLO 混合训练（pose）":
+                    result = exporter.export_yolo_mixed_pose(
+                        export_view,
+                        output_dir,
+                        det_field=label_field,
+                        kp_field=kp_field,
+                        detection_classes=mixed_detection_classes or ["pallet"],
+                        classes=classes,
+                        splits=splits,
+                        num_keypoints=int(mixed_num_keypoints),
+                        class_names=locked_class_names or None,
+                    )
                 elif format_choice == "YOLO Pose (四边形转关键点)":
                     result = exporter.export_yolo_pose_from_polylines(
                         export_view, output_dir, label_field=label_field, classes=classes, splits=splits,
@@ -189,7 +238,9 @@ def _render_export():
                     "output_dir": output_dir,
                     "data_yaml": data_yaml,
                     "label_field": label_field,
+                    "kp_field": kp_field or None,
                     "classes": classes,
+                    "mixed_detection_classes": mixed_detection_classes or None,
                     "class_order_yaml": class_order_yaml or None,
                     "locked_class_names": locked_class_names or None,
                     "splits": str(splits),
