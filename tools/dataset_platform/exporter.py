@@ -456,220 +456,6 @@ export_yolov8_pose = export_yolo_pose
 
 
 # ===================================================================
-# YOLO Pose 混合导出（Pose + Detection-only）
-# ===================================================================
-
-def _infer_num_keypoints(
-    ds: fo.Dataset | fo.DatasetView,
-    kp_field: str,
-    default: int = 4,
-) -> int:
-    if kp_field not in ds.get_field_schema():
-        return default
-    from fiftyone import ViewField as F
-    view = ds.match(F(f"{kp_field}.keypoints").length() > 0)
-    for sample in view.head(20):
-        kps = sample[kp_field]
-        if kps and kps.keypoints:
-            return len(kps.keypoints[0].points)
-    return default
-
-
-def export_yolo_mixed_pose(
-    ds: fo.Dataset | fo.DatasetView,
-    output_dir: str | Path,
-    det_field: str = "ground_truth",
-    kp_field: str = "ground_truth_keypoints",
-    detection_classes: Optional[list[str]] = None,
-    classes: Optional[list[str]] = None,
-    splits: SplitsType = "train",
-    num_keypoints: Optional[int] = None,
-    class_names: Optional[list[str]] = None,
-) -> dict:
-    """
-    导出 YOLO Pose 混合训练格式。
-
-    - kp_field 中的对象按正常 pose 标签写出
-    - det_field 中 detection_classes 指定的检测类按 bbox + 全 0 关键点写出
-
-    该格式仍用于 YOLO task=pose 训练。
-    """
-    output_dir = Path(output_dir).resolve()
-    schema = ds.get_field_schema()
-    has_det = det_field in schema
-    has_kp = kp_field in schema
-    if not has_det and not has_kp:
-        logger.warning("检测字段 '%s' 和关键点字段 '%s' 均不存在", det_field, kp_field)
-        return {"exported": 0}
-
-    detection_class_set = set(detection_classes or ["pallet"])
-    export_filter = set(classes or [])
-    if export_filter:
-        detection_class_set &= export_filter
-
-    fallback_num_keypoints = int(num_keypoints) if num_keypoints else 4
-    num_keypoints = _infer_num_keypoints(ds, kp_field, default=fallback_num_keypoints)
-
-    pose_classes = _distinct_label_classes(ds, kp_field) if has_kp else []
-    det_classes = _distinct_label_classes(ds, det_field) if has_det else []
-    mixed_classes = pose_classes + [c for c in det_classes if c in detection_class_set]
-    class_map = _build_ordered_class_map(mixed_classes, classes=classes, class_names=class_names)
-    if not class_map:
-        logger.warning("无可导出的混合训练类别")
-        return {"exported": 0}
-
-    eligible_ids: list[str] = []
-    for sample in ds.iter_samples(progress=True):
-        has_lines = False
-        if has_kp:
-            kps_data = sample[kp_field]
-            if kps_data and kps_data.keypoints:
-                for kp in kps_data.keypoints:
-                    if kp.label in class_map and (not export_filter or kp.label in export_filter):
-                        has_lines = True
-                        break
-        if not has_lines and has_det and detection_class_set:
-            det_data = sample[det_field]
-            if det_data and det_data.detections:
-                for det in det_data.detections:
-                    if det.label in detection_class_set and det.label in class_map:
-                        has_lines = True
-                        break
-        if has_lines:
-            eligible_ids.append(sample.id)
-
-    if not eligible_ids:
-        logger.warning("没有可导出的混合训练样本")
-        return {"exported": 0}
-
-    view = ds.select(eligible_ids)
-    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
-    all_split_names = list(split_ids.keys())
-
-    _ensure_dir(output_dir)
-    data_yaml = {
-        "path": str(output_dir),
-        "names": {v: k for k, v in class_map.items()},
-        "nc": len(class_map),
-        "kpt_shape": [int(num_keypoints), 3],
-    }
-    for sn in all_split_names:
-        data_yaml[sn] = f"{sn}/images"
-    with open(output_dir / "data.yaml", "w") as f:
-        yaml.dump(data_yaml, f, default_flow_style=False, allow_unicode=True)
-
-    total = 0
-    pose_objects = 0
-    detection_only_objects = 0
-    per_split: dict[str, int] = {}
-    zero_kpts = " ".join(["0.000000 0.000000 0"] * int(num_keypoints))
-
-    for split_name, ids in split_ids.items():
-        if not ids:
-            per_split[split_name] = 0
-            continue
-        img_dir = _ensure_dir(output_dir / split_name / "images")
-        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
-        sub_view = view.select(ids)
-
-        count = 0
-        for sample in sub_view.iter_samples(progress=True):
-            lines: list[str] = []
-
-            det_map: dict[str, list] = {}
-            if has_det:
-                det_data = sample[det_field]
-                if det_data and det_data.detections:
-                    for det in det_data.detections:
-                        det_map.setdefault(det.label, []).append(det.bounding_box)
-
-            if has_kp:
-                kps_data = sample[kp_field]
-                if kps_data and kps_data.keypoints:
-                    for kp in kps_data.keypoints:
-                        if kp.label not in class_map:
-                            continue
-                        if export_filter and kp.label not in export_filter:
-                            continue
-
-                        bboxes = det_map.get(kp.label, [])
-                        if bboxes:
-                            x, y, w, h = bboxes.pop(0)
-                        else:
-                            xs = [p[0] for p in kp.points if p[0] > 0]
-                            ys = [p[1] for p in kp.points if p[1] > 0]
-                            if not xs or not ys:
-                                continue
-                            x_min, x_max = min(xs), max(xs)
-                            y_min, y_max = min(ys), max(ys)
-                            margin = 0.02
-                            x = max(0, x_min - margin)
-                            y = max(0, y_min - margin)
-                            w = min(1, x_max - x_min + 2 * margin)
-                            h = min(1, y_max - y_min + 2 * margin)
-
-                        cx = x + w / 2
-                        cy = y + h / 2
-                        parts = [
-                            f"{class_map[kp.label]}",
-                            f"{cx:.6f}",
-                            f"{cy:.6f}",
-                            f"{w:.6f}",
-                            f"{h:.6f}",
-                        ]
-                        for pi in range(int(num_keypoints)):
-                            if pi < len(kp.points):
-                                kx, ky = kp.points[pi][0], kp.points[pi][1]
-                                if kp.confidence and pi < len(kp.confidence):
-                                    kv = kp.confidence[pi]
-                                else:
-                                    kv = 2.0
-                                parts.extend([f"{kx:.6f}", f"{ky:.6f}", f"{kv:.0f}"])
-                            else:
-                                parts.extend(["0.000000", "0.000000", "0"])
-                        lines.append(" ".join(parts))
-                        pose_objects += 1
-
-            if has_det and detection_class_set:
-                det_data = sample[det_field]
-                if det_data and det_data.detections:
-                    for det in det_data.detections:
-                        if det.label not in detection_class_set or det.label not in class_map:
-                            continue
-                        x, y, w, h = det.bounding_box
-                        cx = x + w / 2
-                        cy = y + h / 2
-                        lines.append(
-                            f"{class_map[det.label]} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} {zero_kpts}"
-                        )
-                        detection_only_objects += 1
-
-            if lines:
-                fname = _copy_image(sample.filepath, img_dir)
-                stem = Path(fname).stem
-                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
-                count += 1
-
-        per_split[split_name] = count
-        total += count
-
-    logger.info(
-        "YOLO Mixed Pose 导出: %d 张图片, pose=%d, detection-only=%d",
-        total, pose_objects, detection_only_objects,
-    )
-    return {
-        "exported": total,
-        "per_split": per_split,
-        "classes": list(class_map.keys()),
-        "num_keypoints": int(num_keypoints),
-        "detection_classes": sorted(detection_class_set),
-        "pose_objects": pose_objects,
-        "detection_only_objects": detection_only_objects,
-        "output_dir": str(output_dir),
-    }
-
-
-# ===================================================================
 # YOLO Pose 导出（从四边形 Polylines 转换）
 # ===================================================================
 
@@ -911,6 +697,218 @@ def export_yolo_pose_from_polylines(
         "per_split": per_split,
         "classes": list(class_map.keys()),
         "kpt_shape": [4, 3],
+        "edge_invisible_keypoints": total_edge_invisible,
+        "occluded_keypoints": total_occluded,
+        "output_dir": str(output_dir),
+    }
+
+
+# ===================================================================
+# YOLO Pose 混合导出（四边形 Pose + Detection-only）
+# ===================================================================
+
+def export_yolo_mixed_pose(
+    ds: fo.Dataset | fo.DatasetView,
+    output_dir: str | Path,
+    pose_field: str = "ground_truth_polylines",
+    det_field: str = "ground_truth",
+    detection_classes: Optional[list[str]] = None,
+    classes: Optional[list[str]] = None,
+    splits: SplitsType = "train",
+    edge_threshold: float = 5.0,
+    bbox_margin: float = 0.0,
+    class_names: Optional[list[str]] = None,
+) -> dict:
+    """
+    导出 YOLO Pose 混合训练格式：四边形转 4 个关键点 + 检测框全 0 关键点。
+
+    用途：
+      - pose_field 中的 chuan/tian 等四边形 Polylines 正常转为 tl/tr/br/bl 关键点
+      - det_field 中 detection_classes 指定的类别（默认 pallet）写为 bbox + 4 个全 0 关键点
+
+    输出仍是 YOLO task=pose 可训练的数据集，kpt_shape 固定为 [4, 3]。
+    """
+    output_dir = Path(output_dir).resolve()
+    schema = ds.get_field_schema()
+    has_pose = pose_field in schema
+    has_det = det_field in schema
+    if not has_pose and not has_det:
+        logger.warning("四边形字段 '%s' 和检测框字段 '%s' 均不存在", pose_field, det_field)
+        return {"exported": 0}
+
+    detection_class_set = set(detection_classes or ["pallet"])
+    export_filter = set(classes or [])
+    if export_filter:
+        detection_class_set &= export_filter
+
+    pose_classes = _distinct_label_classes(ds, pose_field) if has_pose else []
+    det_classes = _distinct_label_classes(ds, det_field) if has_det else []
+    mixed_classes = pose_classes + [c for c in det_classes if c in detection_class_set]
+    class_map = _build_ordered_class_map(mixed_classes, classes=classes, class_names=class_names)
+    if not class_map:
+        logger.warning("无可导出的混合训练类别")
+        return {"exported": 0}
+
+    eligible_ids: list[str] = []
+    for sample in ds.iter_samples(progress=True):
+        has_lines = False
+        if has_pose:
+            poly_data = sample[pose_field]
+            polylines = getattr(poly_data, "polylines", None)
+            if polylines:
+                for poly in polylines:
+                    if poly.label in class_map and (not export_filter or poly.label in export_filter):
+                        pts = poly.points[0] if poly.points else []
+                        if len(pts) == 4:
+                            has_lines = True
+                            break
+        if not has_lines and has_det and detection_class_set:
+            det_data = sample[det_field]
+            detections = getattr(det_data, "detections", None)
+            if detections:
+                for det in detections:
+                    if det.label in detection_class_set and det.label in class_map:
+                        has_lines = True
+                        break
+        if has_lines:
+            eligible_ids.append(sample.id)
+
+    if not eligible_ids:
+        logger.warning("没有可导出的混合训练样本")
+        return {"exported": 0}
+
+    view = ds.select(eligible_ids)
+    try:
+        view.compute_metadata(overwrite=False)
+    except Exception:
+        logger.info("compute_metadata 跳过，将从图片文件读取尺寸")
+
+    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    all_split_names = list(split_ids.keys())
+
+    _ensure_dir(output_dir)
+    data_yaml = {
+        "path": str(output_dir),
+        "names": {v: k for k, v in class_map.items()},
+        "nc": len(class_map),
+        "kpt_shape": [4, 3],
+        "flip_idx": [1, 0, 3, 2],
+    }
+    for sn in all_split_names:
+        data_yaml[sn] = f"{sn}/images"
+    with open(output_dir / "data.yaml", "w") as f:
+        yaml.dump(data_yaml, f, default_flow_style=False, allow_unicode=True)
+
+    total = 0
+    pose_objects = 0
+    detection_only_objects = 0
+    total_edge_invisible = 0
+    total_occluded = 0
+    per_split: dict[str, int] = {}
+    zero_kpts = "0.000000 0.000000 0 " * 4
+    zero_kpts = zero_kpts.strip()
+
+    for split_name, ids in split_ids.items():
+        if not ids:
+            per_split[split_name] = 0
+            continue
+        img_dir = _ensure_dir(output_dir / split_name / "images")
+        lbl_dir = _ensure_dir(output_dir / split_name / "labels")
+        sub_view = view.select(ids)
+
+        count = 0
+        for sample in sub_view.iter_samples(progress=True):
+            lines: list[str] = []
+            img_w, img_h = _get_image_dims(sample)
+
+            if has_pose:
+                poly_data = sample[pose_field]
+                polylines = getattr(poly_data, "polylines", None)
+                if polylines:
+                    if img_w <= 0 or img_h <= 0:
+                        logger.warning("无法获取图片尺寸，跳过四边形关键点: %s", sample.filepath)
+                    else:
+                        for poly in polylines:
+                            if poly.label not in class_map:
+                                continue
+                            if export_filter and poly.label not in export_filter:
+                                continue
+
+                            pts = poly.points[0] if poly.points else []
+                            if len(pts) != 4:
+                                continue
+
+                            ordered = _order_quad_tl_tr_br_bl(pts)
+                            occu_flags = _get_occlusion_flags(poly)
+                            vis = _compute_kpt_visibility(
+                                ordered, img_w, img_h, edge_threshold,
+                                occlusion_flags=occu_flags if occu_flags else None,
+                            )
+                            total_edge_invisible += sum(1 for v in vis if v == 0)
+                            total_occluded += sum(1 for v in vis if v == 1)
+
+                            xs = [p[0] for p in ordered]
+                            ys = [p[1] for p in ordered]
+                            x_min = max(0.0, min(xs) - bbox_margin)
+                            y_min = max(0.0, min(ys) - bbox_margin)
+                            x_max = min(1.0, max(xs) + bbox_margin)
+                            y_max = min(1.0, max(ys) + bbox_margin)
+                            bw = x_max - x_min
+                            bh = y_max - y_min
+                            cx = (x_min + x_max) / 2
+                            cy = (y_min + y_max) / 2
+
+                            parts = [
+                                f"{class_map[poly.label]}",
+                                f"{cx:.6f}",
+                                f"{cy:.6f}",
+                                f"{bw:.6f}",
+                                f"{bh:.6f}",
+                            ]
+                            for (kx, ky), kv in zip(ordered, vis):
+                                if kv == 0:
+                                    parts.extend(["0.000000", "0.000000", "0"])
+                                else:
+                                    parts.extend([f"{kx:.6f}", f"{ky:.6f}", f"{kv}"])
+                            lines.append(" ".join(parts))
+                            pose_objects += 1
+
+            if has_det and detection_class_set:
+                det_data = sample[det_field]
+                detections = getattr(det_data, "detections", None)
+                if detections:
+                    for det in detections:
+                        if det.label not in detection_class_set or det.label not in class_map:
+                            continue
+                        x, y, w, h = det.bounding_box
+                        cx = x + w / 2
+                        cy = y + h / 2
+                        lines.append(
+                            f"{class_map[det.label]} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} {zero_kpts}"
+                        )
+                        detection_only_objects += 1
+
+            if lines:
+                fname = _copy_image(sample.filepath, img_dir)
+                stem = Path(fname).stem
+                (lbl_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
+                count += 1
+
+        per_split[split_name] = count
+        total += count
+
+    logger.info(
+        "YOLO Mixed Pose 导出: %d 张图片, pose=%d, detection-only=%d",
+        total, pose_objects, detection_only_objects,
+    )
+    return {
+        "exported": total,
+        "per_split": per_split,
+        "classes": list(class_map.keys()),
+        "kpt_shape": [4, 3],
+        "detection_classes": sorted(detection_class_set),
+        "pose_objects": pose_objects,
+        "detection_only_objects": detection_only_objects,
         "edge_invisible_keypoints": total_edge_invisible,
         "occluded_keypoints": total_occluded,
         "output_dir": str(output_dir),
