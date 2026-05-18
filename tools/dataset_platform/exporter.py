@@ -220,6 +220,36 @@ def _normalize_split_ids(
     return {_YOLO_SPLIT_NAMES.get(k, k): v for k, v in split_ids.items()}
 
 
+def _background_ids(ds: fo.Dataset | fo.DatasetView, background_tag: str | None) -> list[str]:
+    if not background_tag:
+        return []
+    try:
+        return list(ds.match_tags(background_tag).values("id"))
+    except Exception:
+        return []
+
+
+def _add_background_to_train(
+    split_ids: dict[str, list[str]],
+    background_ids: list[str],
+) -> dict[str, list[str]]:
+    """将背景负样本强制放入 train，并从其他 split 去重。"""
+    if not background_ids:
+        return split_ids
+    bg_set = set(background_ids)
+    cleaned = {
+        split_name: [sid for sid in ids if sid not in bg_set]
+        for split_name, ids in split_ids.items()
+    }
+    train_ids = cleaned.setdefault("train", [])
+    seen_train = set(train_ids)
+    for sid in background_ids:
+        if sid not in seen_train:
+            train_ids.append(sid)
+            seen_train.add(sid)
+    return cleaned
+
+
 def _copy_image(src: str | Path, dst_dir: Path) -> str:
     """复制图片到目标目录，返回文件名。"""
     src = Path(src)
@@ -559,6 +589,8 @@ def export_yolo_pose_from_polylines(
     edge_threshold: float = 5.0,
     bbox_margin: float = 0.0,
     class_names: Optional[list[str]] = None,
+    include_background: bool = True,
+    background_tag: str = "background",
 ) -> dict:
     """
     从四边形 Polylines 导出 YOLO Pose 格式。
@@ -598,7 +630,13 @@ def export_yolo_pose_from_polylines(
     except Exception:
         logger.info("compute_metadata 跳过，将从图片文件读取尺寸")
 
+    bg_ids = _background_ids(ds, background_tag) if include_background else []
+    bg_set = set(bg_ids)
+    export_ids = list(dict.fromkeys(list(view.values("id")) + bg_ids))
+    export_view = ds.select(export_ids) if bg_ids else view
+
     split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    split_ids = _add_background_to_train(split_ids, bg_ids)
     all_split_names = list(split_ids.keys())
 
     _ensure_dir(output_dir)
@@ -625,10 +663,19 @@ def export_yolo_pose_from_polylines(
             continue
         img_dir = _ensure_dir(output_dir / split_name / "images")
         lbl_dir = _ensure_dir(output_dir / split_name / "labels")
-        sub_view = view.select(ids)
+        sub_view = export_view.select(ids)
 
         count = 0
+        background_count = 0
         for sample in sub_view.iter_samples(progress=True):
+            if sample.id in bg_set:
+                fname = _copy_image(sample.filepath, img_dir)
+                stem = Path(fname).stem
+                (lbl_dir / f"{stem}.txt").write_text("")
+                count += 1
+                background_count += 1
+                continue
+
             poly_data = sample[label_field]
             if poly_data is None or not poly_data.polylines:
                 continue
@@ -687,6 +734,8 @@ def export_yolo_pose_from_polylines(
 
         per_split[split_name] = count
         total += count
+        if background_count:
+            logger.info("YOLO Pose 背景负样本导出到 %s: %d 张", split_name, background_count)
 
     logger.info(
         "YOLO Pose (from polylines) 导出: %d 张图片, 边界不可见关键点: %d, 遮挡关键点: %d",
@@ -699,6 +748,8 @@ def export_yolo_pose_from_polylines(
         "kpt_shape": [4, 3],
         "edge_invisible_keypoints": total_edge_invisible,
         "occluded_keypoints": total_occluded,
+        "background_images": len(bg_ids),
+        "background_tag": background_tag if include_background else None,
         "output_dir": str(output_dir),
     }
 
@@ -718,6 +769,8 @@ def export_yolo_mixed_pose(
     edge_threshold: float = 5.0,
     bbox_margin: float = 0.0,
     class_names: Optional[list[str]] = None,
+    include_background: bool = True,
+    background_tag: str = "background",
 ) -> dict:
     """
     导出 YOLO Pose 混合训练格式：四边形转 4 个关键点 + 检测框全 0 关键点。
@@ -773,17 +826,22 @@ def export_yolo_mixed_pose(
         if has_lines:
             eligible_ids.append(sample.id)
 
-    if not eligible_ids:
+    bg_ids = _background_ids(ds, background_tag) if include_background else []
+    bg_set = set(bg_ids)
+    if not eligible_ids and not bg_ids:
         logger.warning("没有可导出的混合训练样本")
         return {"exported": 0}
 
-    view = ds.select(eligible_ids)
+    export_ids = list(dict.fromkeys(eligible_ids + bg_ids))
+    view = ds.select(export_ids)
     try:
         view.compute_metadata(overwrite=False)
     except Exception:
         logger.info("compute_metadata 跳过，将从图片文件读取尺寸")
 
-    split_ids = _normalize_split_ids(_resolve_splits(view, splits))
+    positive_view = ds.select(eligible_ids) if eligible_ids else ds.select([])
+    split_ids = _normalize_split_ids(_resolve_splits(positive_view, splits))
+    split_ids = _add_background_to_train(split_ids, bg_ids)
     all_split_names = list(split_ids.keys())
 
     _ensure_dir(output_dir)
@@ -817,7 +875,16 @@ def export_yolo_mixed_pose(
         sub_view = view.select(ids)
 
         count = 0
+        background_count = 0
         for sample in sub_view.iter_samples(progress=True):
+            if sample.id in bg_set:
+                fname = _copy_image(sample.filepath, img_dir)
+                stem = Path(fname).stem
+                (lbl_dir / f"{stem}.txt").write_text("")
+                count += 1
+                background_count += 1
+                continue
+
             lines: list[str] = []
             img_w, img_h = _get_image_dims(sample)
 
@@ -896,6 +963,8 @@ def export_yolo_mixed_pose(
 
         per_split[split_name] = count
         total += count
+        if background_count:
+            logger.info("YOLO Mixed Pose 背景负样本导出到 %s: %d 张", split_name, background_count)
 
     logger.info(
         "YOLO Mixed Pose 导出: %d 张图片, pose=%d, detection-only=%d",
@@ -911,6 +980,8 @@ def export_yolo_mixed_pose(
         "detection_only_objects": detection_only_objects,
         "edge_invisible_keypoints": total_edge_invisible,
         "occluded_keypoints": total_occluded,
+        "background_images": len(bg_ids),
+        "background_tag": background_tag if include_background else None,
         "output_dir": str(output_dir),
     }
 

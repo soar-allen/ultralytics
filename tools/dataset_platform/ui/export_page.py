@@ -55,6 +55,22 @@ def _render_export():
     else:
         export_view = ds
 
+    background_formats = {"YOLO 混合训练（pose）", "YOLO Pose (四边形转关键点)"}
+    include_background_train = False
+    background_tag = "background"
+    if format_choice in background_formats and background_tag in all_tags:
+        include_background_train = st.checkbox(
+            "将 background 标签图片全部加入 train 作为负样本",
+            value=True,
+            key="export_include_background_train",
+            help="这些图片会强制进入 train/images，并生成空 label 文件，不参与 valid/test 划分。",
+        )
+        if include_background_train:
+            bg_view = ds.match_tags(background_tag)
+            export_ids = list(dict.fromkeys(list(export_view.values("id")) + list(bg_view.values("id"))))
+            export_view = ds.select(export_ids)
+            st.info(f"已加入 `{background_tag}` 背景图 {len(bg_view)} 张，导出时会全部放入 train。")
+
     # ── 以下配置仅 YOLO 格式需要 ──
     splits: str | dict[str, float] = "train"
     total_pct = 100
@@ -224,12 +240,16 @@ def _render_export():
                         edge_threshold=edge_threshold,
                         bbox_margin=bbox_margin,
                         class_names=locked_class_names or None,
+                        include_background=include_background_train,
+                        background_tag=background_tag,
                     )
                 elif format_choice == "YOLO Pose (四边形转关键点)":
                     result = exporter.export_yolo_pose_from_polylines(
                         export_view, output_dir, label_field=label_field, classes=classes, splits=splits,
                         edge_threshold=edge_threshold, bbox_margin=bbox_margin,
                         class_names=locked_class_names or None,
+                        include_background=include_background_train,
+                        background_tag=background_tag,
                     )
                 elif format_choice == "YOLO OBB (旋转框)":
                     result = exporter.export_yolo_obb(
@@ -259,6 +279,8 @@ def _render_export():
                     "kp_field": kp_field or None,
                     "classes": classes,
                     "mixed_detection_classes": mixed_detection_classes or None,
+                    "include_background_train": include_background_train,
+                    "background_tag": background_tag if include_background_train else None,
                     "class_order_yaml": class_order_yaml or None,
                     "locked_class_names": locked_class_names or None,
                     "splits": str(splits),

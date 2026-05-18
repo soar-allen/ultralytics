@@ -102,6 +102,7 @@ tools/dataset_platform/
 
 - 支持按类别/Tags 过滤，仅导出有标签图像，自动生成 data.yaml
 - 支持按比例自动划分 train/valid/test
+- YOLO Pose（四边形转关键点）和 YOLO 混合训练（pose）可将 `background` Tag 图片全部加入 train 作为空标注负样本
 - **导出-训练衔接**: 导出完成后自动记录 data.yaml 路径，可一键跳转训练管理
 
 ### 7. 训练管理 (Training)
