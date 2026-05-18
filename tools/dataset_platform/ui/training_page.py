@@ -35,14 +35,16 @@ def _render_training_page():
         st.info("请先选择数据集")
         return
 
-    tab_train, tab_progress, tab_predict, tab_feedback = st.tabs([
-        "🚀 训练配置与启动", "📊 训练进度与历史", "🔮 通用预测", "🔄 训练后回灌",
+    tab_train, tab_progress, tab_convert, tab_predict, tab_feedback = st.tabs([
+        "🚀 训练配置与启动", "📊 训练进度与历史", "🔁 模型格式转换", "🔮 通用预测", "🔄 训练后回灌",
     ])
 
     with tab_train:
         _render_train_config(ds)
     with tab_progress:
         _render_progress_and_history(ds)
+    with tab_convert:
+        _render_model_export(ds)
     with tab_predict:
         _render_predict(ds)
     with tab_feedback:
@@ -653,6 +655,196 @@ def _render_epoch_chart(epoch_history: list[dict]):
         if map_cols:
             st.caption("精度曲线")
             st.line_chart(df[map_cols])
+
+
+def _parse_imgsz_text(value: str) -> int | list[int]:
+    parts = [p for p in value.replace(",", " ").split() if p]
+    if not parts:
+        raise ValueError("请输入 imgsz，例如 640 或 640 480")
+    nums = [int(p) for p in parts]
+    if len(nums) == 1:
+        return nums[0]
+    if len(nums) == 2:
+        return nums
+    raise ValueError("imgsz 只支持一个值或两个值，例如 640 或 640 480")
+
+
+def _render_model_export(ds):
+    st.subheader("模型格式转换")
+    st.caption("参数与根目录 export.py 保持一致，转换结果由 Ultralytics 保存到默认导出位置。")
+
+    last_best = ds.info.get("last_best_pt", "")
+    history = trainer.get_training_history(ds)
+    weight_options = [h.get("best_pt", "") for h in reversed(history) if h.get("best_pt")]
+
+    st.markdown("#### 🧠 模型权重")
+    model_source = st.radio(
+        "权重来源",
+        ["最新 best.pt", "历史权重", "自定义路径", "输入模型名称"],
+        key="model_export_source", horizontal=True,
+    )
+
+    weights = ""
+    if model_source == "最新 best.pt":
+        if last_best and Path(last_best).exists():
+            weights = last_best
+            st.info(f"使用最新权重: `{Path(last_best).name}` — `{last_best}`")
+        elif last_best:
+            st.warning(f"最新权重文件不存在: `{last_best}`，请选择其他来源")
+        else:
+            st.warning("暂无训练权重记录。请先完成训练或选择其他来源。")
+    elif model_source == "历史权重":
+        if weight_options:
+            weights = st.selectbox(
+                "选择历史权重（最新在前）", weight_options,
+                format_func=lambda p: Path(p).name,
+                key="model_export_hist_weight",
+            )
+        else:
+            st.warning("暂无历史权重记录")
+    elif model_source == "自定义路径":
+        weights = _path_browser(
+            "模型权重 (.pt)", "model_export_weight_path", mode="file",
+            file_extensions=(".pt", ".pth", ".yaml"),
+            start_dir=str(Path(last_best).parent) if last_best and Path(last_best).parent.exists() else "",
+        )
+    else:
+        weights = st.text_input(
+            "模型名称", value="yolo11n.pt", key="model_export_model_name",
+            help="Ultralytics 预训练模型名称，首次使用可能会自动下载",
+        )
+
+    st.markdown("---")
+    st.markdown("#### ⚙️ 转换参数")
+    col_fmt, col_task, col_img, col_dev = st.columns(4)
+    with col_fmt:
+        export_format = st.selectbox(
+            "目标格式",
+            trainer.SUPPORTED_EXPORT_FORMATS,
+            index=trainer.SUPPORTED_EXPORT_FORMATS.index("onnx"),
+            key="model_export_format",
+        )
+    with col_task:
+        export_task = st.selectbox(
+            "任务类型",
+            [None] + trainer.SUPPORTED_EXPORT_TASKS,
+            index=0,
+            key="model_export_task",
+            format_func=lambda x: "自动检测" if x is None else x,
+        )
+    with col_img:
+        imgsz_text = st.text_input(
+            "Image Size",
+            value="640",
+            key="model_export_imgsz",
+            help="例如 640 或 640 480",
+        )
+    with col_dev:
+        device = st.text_input("Device", value="0", key="model_export_device")
+
+    col_b, col_op, col_ws, col_frac = st.columns(4)
+    with col_b:
+        batch = st.number_input("Batch Size", 1, 256, 1, key="model_export_batch")
+    with col_op:
+        opset_value = st.number_input(
+            "ONNX Opset (0=自动)",
+            0, 30, 0, 1,
+            key="model_export_opset",
+        )
+    with col_ws:
+        workspace_value = st.number_input(
+            "TensorRT Workspace GB (0=自动)",
+            0.0, 128.0, 0.0, 0.5,
+            key="model_export_workspace",
+        )
+    with col_frac:
+        fraction = st.number_input(
+            "INT8 校准数据比例",
+            0.01, 1.0, 1.0, 0.05,
+            key="model_export_fraction",
+        )
+
+    with st.expander("高级导出选项", expanded=False):
+        col_a, col_b2, col_c, col_d = st.columns(4)
+        with col_a:
+            half = st.checkbox("half (FP16)", value=False, key="model_export_half")
+            int8 = st.checkbox("int8", value=False, key="model_export_int8")
+        with col_b2:
+            dynamic = st.checkbox("dynamic", value=False, key="model_export_dynamic")
+            simplify = st.checkbox("simplify", value=False, key="model_export_simplify")
+        with col_c:
+            nms = st.checkbox("nms", value=False, key="model_export_nms")
+            keras = st.checkbox("keras", value=False, key="model_export_keras")
+        with col_d:
+            optimize = st.checkbox("optimize", value=False, key="model_export_optimize")
+
+    if st.button("🔁 开始转换", key="btn_model_export", type="primary"):
+        if not weights:
+            st.error("请指定模型权重")
+            return
+        try:
+            imgsz = _parse_imgsz_text(imgsz_text)
+        except Exception as e:
+            st.error(str(e))
+            return
+
+        with st.spinner("模型格式转换中..."):
+            try:
+                record = trainer.export_model_format(
+                    weights=weights,
+                    task=export_task,
+                    export_format=export_format,
+                    imgsz=imgsz,
+                    device=device,
+                    batch=int(batch),
+                    opset=int(opset_value) if opset_value else None,
+                    half=half,
+                    int8=int8,
+                    dynamic=dynamic,
+                    simplify=simplify,
+                    nms=nms,
+                    workspace=float(workspace_value) if workspace_value else None,
+                    fraction=float(fraction),
+                    keras=keras,
+                    optimize=optimize,
+                    ds=ds,
+                )
+            except Exception as e:
+                st.error(f"转换失败: {e}")
+                return
+
+        st.success("✅ 转换完成")
+        st.info(f"输出路径: `{record.get('output_path')}`")
+        with st.expander("转换记录", expanded=False):
+            st.json(record)
+
+    st.markdown("---")
+    st.markdown("### 📜 转换历史")
+    export_history = ds.info.get("model_export_history", [])
+    if not export_history:
+        st.info("暂无模型格式转换记录。")
+        return
+
+    import pandas as pd
+
+    rows = []
+    for i, rec in enumerate(reversed(export_history)):
+        ts = rec.get("timestamp", "")
+        try:
+            ts_display = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ts_display = ts[:16] if ts else ""
+        rows.append({
+            "#": len(export_history) - i,
+            "时间": ts_display,
+            "权重": Path(rec.get("weights", "")).name,
+            "任务": rec.get("task") or "auto",
+            "格式": rec.get("format", ""),
+            "ImgSz": rec.get("imgsz", ""),
+            "用时": _fmt_duration(rec.get("duration_seconds", 0)),
+            "输出": rec.get("output_path", ""),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════ 通用预测 ═══════════════════

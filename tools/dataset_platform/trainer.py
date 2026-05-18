@@ -645,6 +645,115 @@ def get_training_history(ds: fo.Dataset) -> list[dict]:
     return ds.info.get("training_history", [])
 
 
+SUPPORTED_EXPORT_FORMATS = [
+    "torchscript",
+    "onnx",
+    "openvino",
+    "engine",
+    "coreml",
+    "saved_model",
+    "pb",
+    "tflite",
+    "edgetpu",
+    "tfjs",
+    "paddle",
+    "mnn",
+    "ncnn",
+    "imx",
+    "rknn",
+    "executorch",
+    "axelera",
+]
+
+SUPPORTED_EXPORT_TASKS = ["detect", "segment", "classify", "pose", "obb"]
+
+
+def export_model_format(
+    weights: str,
+    task: str | None = None,
+    export_format: str = "onnx",
+    imgsz: int | list[int] = 640,
+    device: str = "0",
+    batch: int = 1,
+    opset: int | None = None,
+    half: bool = False,
+    int8: bool = False,
+    dynamic: bool = False,
+    simplify: bool = False,
+    nms: bool = False,
+    workspace: float | None = None,
+    fraction: float = 1.0,
+    keras: bool = False,
+    optimize: bool = False,
+    ds: Optional[fo.Dataset] = None,
+) -> dict:
+    """按根目录 export.py 的参数语义转换 YOLO 模型格式。"""
+    if export_format not in SUPPORTED_EXPORT_FORMATS:
+        raise ValueError(f"不支持的导出格式: {export_format}")
+    if task is not None and task not in SUPPORTED_EXPORT_TASKS:
+        raise ValueError(f"不支持的任务类型: {task}")
+    if not weights:
+        raise ValueError("请指定模型权重")
+    looks_like_path = Path(weights).is_absolute() or "/" in weights or "\\" in weights
+    if looks_like_path and weights.endswith((".pt", ".pth", ".yaml")) and not Path(weights).exists():
+        raise FileNotFoundError(f"模型权重不存在: {weights}")
+
+    from ultralytics import YOLO
+
+    model = YOLO(weights, task=task)
+    export_kwargs = dict(
+        format=export_format,
+        imgsz=imgsz,
+        batch=batch,
+        half=half,
+        int8=int8,
+        dynamic=dynamic,
+        simplify=simplify,
+        nms=nms,
+        fraction=fraction,
+        keras=keras,
+        optimize=optimize,
+    )
+    if device is not None:
+        export_kwargs["device"] = int(device) if str(device).isdigit() else device
+    if opset is not None:
+        export_kwargs["opset"] = int(opset)
+    if workspace is not None:
+        export_kwargs["workspace"] = float(workspace)
+
+    start = time.time()
+    output_path = model.export(**export_kwargs)
+    end = time.time()
+    record = {
+        "timestamp": datetime.fromtimestamp(start).isoformat(),
+        "end_time": datetime.fromtimestamp(end).isoformat(),
+        "duration_seconds": round(end - start, 1),
+        "weights": weights,
+        "task": task,
+        "format": export_format,
+        "imgsz": imgsz,
+        "batch": batch,
+        "device": device,
+        "opset": opset,
+        "half": half,
+        "int8": int8,
+        "dynamic": dynamic,
+        "simplify": simplify,
+        "nms": nms,
+        "workspace": workspace,
+        "fraction": fraction,
+        "keras": keras,
+        "optimize": optimize,
+        "output_path": str(output_path),
+    }
+    if ds is not None:
+        history = ds.info.get("model_export_history", [])
+        history.append(record)
+        ds.info["model_export_history"] = history
+        ds.save()
+    return record
+
+
 def run_post_training_eval(
     ds: fo.Dataset,
     best_pt: str,

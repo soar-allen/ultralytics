@@ -115,6 +115,7 @@ tools/dataset_platform/
 - **训练后回灌**: 自动用 best.pt 预标注 + 评估，为难例挖掘做准备
 - **增量训练回放**: 新增类别全量训练，同时从旧类别抽样回放，降低旧类别遗忘风险
 - **类别顺序锁定**: 导出时可读取上一版 `data.yaml`，保持旧 class id 不变并将新类别追加到末尾
+- **模型格式转换**: 在训练管理中按 `export.py` 参数导出 ONNX、TensorRT Engine、OpenVINO 等格式
 
 ### 8. 标注质量检查 (Quality)
 
