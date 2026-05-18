@@ -87,6 +87,51 @@ def _transform_labels_for_flip(labels, hflip: bool, vflip: bool):
     return labels
 
 
+def _is_polyline_container(value) -> bool:
+    return hasattr(value, "polylines")
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _rotate_point(point, matrix, img_w: int, img_h: int):
+    coords = list(point)
+    if len(coords) < 2 or matrix is None or img_w <= 0 or img_h <= 0:
+        return point
+    px = coords[0] * img_w
+    py = coords[1] * img_h
+    rx = matrix[0, 0] * px + matrix[0, 1] * py + matrix[0, 2]
+    ry = matrix[1, 0] * px + matrix[1, 1] * py + matrix[1, 2]
+    coords[0] = _clamp01(rx / img_w)
+    coords[1] = _clamp01(ry / img_h)
+    return tuple(coords) if isinstance(point, tuple) else coords
+
+
+def _transform_polyline_labels(labels, hflip: bool, vflip: bool, rot_matrix=None, img_w: int = 0, img_h: int = 0):
+    """复制并变换 Polylines 标注；不会复制 detections/keypoints。"""
+    if labels is None or not _is_polyline_container(labels):
+        return None
+
+    labels = labels.copy()
+    for poly in getattr(labels, "polylines", None) or []:
+        points = getattr(poly, "points", None)
+        if not points:
+            continue
+
+        transformed_shapes = []
+        for shape in points:
+            shape_points = _flip_ordered_quad(shape, hflip, vflip) if (hflip or vflip) else list(shape)
+            if rot_matrix is not None:
+                shape_points = [
+                    _rotate_point(point, rot_matrix, img_w, img_h)
+                    for point in shape_points
+                ]
+            transformed_shapes.append(shape_points)
+        poly.points = transformed_shapes
+    return labels
+
+
 def _is_geometric_label_container(value) -> bool:
     return any(
         hasattr(value, attr)
@@ -178,7 +223,7 @@ def _render_class_balance(ds, label_field: str):
     # ── 过采样工具 ──
     st.markdown("---")
     st.markdown("### 🔄 过采样工具")
-    st.caption("通过复制少数类样本及其标注来平衡类别分布。复制的样本会带有 `oversampled` 标签，并可选数据增强。")
+    st.caption("通过复制少数类样本及其多边形标注来平衡类别分布。复制样本不会携带矩形框标注。")
 
     max_cls = max(class_counts, key=class_counts.get)
     max_cnt = class_counts[max_cls]
@@ -219,9 +264,16 @@ def _render_class_balance(ds, label_field: str):
         st.dataframe(plan_rows, use_container_width=True, hide_index=True)
 
     use_augment = st.checkbox(
-        "对复制样本应用随机增强（翻转 + 色彩抖动）", value=True,
+        "对复制样本应用随机增强（翻转 + 旋转 + 色彩抖动）", value=True,
         key="qa_oversample_augment",
-        help="增强后的样本多样性更好，训练效果更佳",
+        help="增强后的样本多样性更好；多边形标注会跟随翻转和旋转同步变换。",
+    )
+    rotate_degrees = st.slider(
+        "随机旋转角度范围",
+        0.0, 30.0, 10.0, 1.0,
+        key="qa_oversample_rotate_degrees",
+        disabled=not use_augment,
+        help="每个复制样本会在 [-角度, +角度] 内随机旋转。建议托盘关键点场景从 5~10 度开始。",
     )
 
     st.markdown("#### 源样本限制")
@@ -330,13 +382,28 @@ def _render_class_balance(ds, label_field: str):
                     img = cv2.imread(str(src_path))
                     hflip = False
                     vflip = False
+                    rot_matrix = None
+                    img_h = 0
+                    img_w = 0
                     if img is not None:
+                        img_h, img_w = img.shape[:2]
                         if random.random() > 0.5:
                             img = cv2.flip(img, 1)
                             hflip = True
                         if random.random() > 0.5:
                             img = cv2.flip(img, 0)
                             vflip = True
+                        if rotate_degrees > 0:
+                            angle = random.uniform(-float(rotate_degrees), float(rotate_degrees))
+                            center = (img_w / 2.0, img_h / 2.0)
+                            rot_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+                            img = cv2.warpAffine(
+                                img,
+                                rot_matrix,
+                                (img_w, img_h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE,
+                            )
                         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
                         hsv[:, :, 0] = (hsv[:, :, 0] + random.uniform(-10, 10)) % 180
                         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.8, 1.2), 0, 255)
@@ -347,10 +414,16 @@ def _render_class_balance(ds, label_field: str):
                         shutil.copy2(src_path, new_path)
                         hflip = False
                         vflip = False
+                        rot_matrix = None
+                        img_h = 0
+                        img_w = 0
                 else:
                     shutil.copy2(src_path, new_path)
                     hflip = False
                     vflip = False
+                    rot_matrix = None
+                    img_h = 0
+                    img_w = 0
 
                 new_sample = fo.Sample(filepath=str(new_path))
                 new_sample.tags.append("oversampled")
@@ -358,18 +431,22 @@ def _render_class_balance(ds, label_field: str):
 
                 src_labels = src.get_field(label_field)
                 if src_labels is not None:
-                    new_sample[label_field] = _transform_labels_for_flip(src_labels, hflip, vflip)
+                    transformed = _transform_polyline_labels(src_labels, hflip, vflip, rot_matrix, img_w, img_h)
+                    if transformed is not None:
+                        new_sample[label_field] = transformed
 
                 for field_name in src.field_names:
                     if field_name in ("id", "filepath", "tags", "metadata", label_field):
                         continue
                     try:
                         val = src.get_field(field_name)
-                        if val is not None and _is_geometric_label_container(val):
-                            new_sample[field_name] = _transform_labels_for_flip(val, hflip, vflip)
-                        elif val is not None and hasattr(val, "copy"):
+                        if val is not None and _is_polyline_container(val):
+                            transformed = _transform_polyline_labels(val, hflip, vflip, rot_matrix, img_w, img_h)
+                            if transformed is not None:
+                                new_sample[field_name] = transformed
+                        elif val is not None and not _is_geometric_label_container(val) and hasattr(val, "copy"):
                             new_sample[field_name] = val.copy()
-                        elif val is not None:
+                        elif val is not None and not _is_geometric_label_container(val):
                             new_sample[field_name] = val
                     except Exception:
                         pass
@@ -392,6 +469,7 @@ def _render_class_balance(ds, label_field: str):
             st.caption(f"  - **{cls}**: +{cnt} 个样本")
         st.info(
             "新增样本已标记 `oversampled` 标签。\n"
+            "复制样本只保留多边形标注，不会复制矩形框标注。\n"
             "导出训练时请包含所有样本。如需撤销，可在 DataHub 中按 `oversampled` 标签筛选后删除。"
         )
 
