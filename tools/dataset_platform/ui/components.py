@@ -96,6 +96,80 @@ def _get_info(ds):
 
 
 # ===================================================================
+# 通用 UI 组件：工作区摘要、操作摘要、危险操作确认
+# ===================================================================
+
+def _format_short_list(values: list[str] | tuple[str, ...], limit: int = 6) -> str:
+    """Format a short comma-separated preview for dense UI captions."""
+    items = [str(v) for v in values if v]
+    if not items:
+        return "无"
+    shown = items[:limit]
+    suffix = f" 等 {len(items)} 项" if len(items) > limit else ""
+    return ", ".join(shown) + suffix
+
+
+def _render_workspace_header():
+    """Render the persistent dataset context at the top of every page."""
+    ds = _get_ds()
+
+    if ds is None:
+        st.title("CV 数据集管理平台")
+        st.info("请先在侧边栏选择或创建数据集")
+        return
+
+    info = _get_info(ds)
+    st.title("CV 数据集管理平台")
+
+    metric_cols = st.columns([1.4, 1, 1, 1, 1.2])
+    metric_cols[0].metric("当前数据集", ds.name)
+    metric_cols[1].metric("样本数", info["num_samples"])
+    metric_cols[2].metric("标签字段", len(info["label_fields"]))
+    metric_cols[3].metric("Tags", len(info["tags"]))
+
+    port = st.session_state.get("fo_port", CONFIG.fiftyone_port)
+    with metric_cols[4]:
+        st.link_button("打开 FiftyOne", f"http://localhost:{port}", use_container_width=True)
+
+    caption_parts = [
+        f"标签字段: {_format_short_list(info['label_fields'])}",
+        f"样本 Tags: {_format_short_list(info['tags'])}",
+    ]
+    last_yaml = st.session_state.get("last_export_data_yaml")
+    if last_yaml:
+        caption_parts.append(f"最近导出 data.yaml: `{last_yaml}`")
+    st.caption(" | ".join(caption_parts))
+    st.markdown("---")
+
+
+def _action_summary(title: str, items: dict[str, object], expanded: bool = True):
+    """Render a compact pre-action summary from label/value pairs."""
+    with st.expander(title, expanded=expanded):
+        for label, value in items.items():
+            if isinstance(value, (list, tuple, set)):
+                value = _format_short_list([str(v) for v in value])
+            elif value is None or value == "":
+                value = "未设置"
+            st.markdown(f"**{label}**: {value}")
+
+
+def _confirm_danger_action(label: str, expected: str, key: str) -> bool:
+    """Render a typed confirmation field for irreversible actions."""
+    st.error(label)
+    confirm = st.text_input(f"输入 `{expected}` 确认", key=key)
+    return confirm == expected
+
+
+def _result_panel(result: dict | list | str, title: str = "执行结果"):
+    """Render a consistent result panel for operation outputs."""
+    with st.expander(title, expanded=True):
+        if isinstance(result, (dict, list)):
+            st.json(result)
+        else:
+            st.write(result)
+
+
+# ===================================================================
 # 通用 UI 组件：路径浏览器
 # ===================================================================
 

@@ -2,16 +2,15 @@
 Streamlit 前端交互界面 - 主入口。
 
 功能区：
-  1. 侧边栏：数据集切换、新建/重命名/删除、页面导航
-  2. Data Hub：数据集统计、标签管理、Tags 筛选、FiftyOne/CVAT 查看
-  3. 数据导入：多格式支持
-  4. 数据清洗与处理
-  5. 自动预标注（独立大页面）
-  6. CVAT 双向同步
-  7. 多格式导出（含训练衔接）
-  8. 训练管理：配置/启动/历史/回灌
-  9. 标注质量检查
-  10. 高级功能：难例挖掘、FiftyOne Brain、完整备份
+  1. 侧边栏：数据集切换、工作流导航、设置入口
+  2. 工作区摘要：当前数据集、样本数、标签字段、Tags、FiftyOne 快捷入口
+  3. 数据总览：数据集统计、标签管理、Tags 筛选、完整性检查
+  4. 导入与整理：多格式导入、清洗、去重、多边形处理、字段管理
+  5. 自动预标注：YOLO Pose / SAM3 辅助标注 / SAM3 标签识别
+  6. CVAT 标注同步：推送、拉取、运行管理、任务状态与审核
+  7. 导出与训练：多格式导出、训练配置、训练进度、模型转换、回灌
+  8. 质量检查：类别平衡、面积分析、空标注检测、标注一致性
+  9. 高级工具：难例挖掘、FiftyOne Brain、完整备份
 
 启动方式：
     streamlit run tools/dataset_platform/ui.py
@@ -33,53 +32,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from tools.dataset_platform.ui.components import _init_state  # noqa: E402
+from tools.dataset_platform.ui.components import _init_state, _render_workspace_header  # noqa: E402
+from tools.dataset_platform.ui.navigation import DEFAULT_PAGE_KEY, load_renderer, page_by_key, resolve_page_key  # noqa: E402
 from tools.dataset_platform.ui.sidebar import _render_sidebar  # noqa: E402
 
 _init_state()
 
-_PAGES = (
-    "📊 Data Hub",
-    "📥 数据导入",
-    "🧹 处理清洗",
-    "🤖 自动预标注",
-    "🔄 CVAT 同步",
-    "📤 数据导出",
-    "🏋️ 训练管理",
-    "🔬 质量检查",
-    "🧠 高级功能",
-)
-
-
-def _render_active_page(page: str):
+def _render_active_page(page_key: str):
     """按需导入并渲染当前激活的页面，避免加载全部模块。"""
-    if page == _PAGES[0]:
-        from tools.dataset_platform.ui.hub import _render_data_hub
-        _render_data_hub()
-    elif page == _PAGES[1]:
-        from tools.dataset_platform.ui.ingestion import _render_ingestion
-        _render_ingestion()
-    elif page == _PAGES[2]:
-        from tools.dataset_platform.ui.processing import _render_processing
-        _render_processing()
-    elif page == _PAGES[3]:
-        from tools.dataset_platform.ui.prediction import _render_auto_predict_page
-        _render_auto_predict_page()
-    elif page == _PAGES[4]:
-        from tools.dataset_platform.ui.cvat_page import _render_cvat_sync
-        _render_cvat_sync()
-    elif page == _PAGES[5]:
-        from tools.dataset_platform.ui.export_page import _render_export
-        _render_export()
-    elif page == _PAGES[6]:
-        from tools.dataset_platform.ui.training_page import _render_training_page
-        _render_training_page()
-    elif page == _PAGES[7]:
-        from tools.dataset_platform.ui.quality_page import _render_quality_page
-        _render_quality_page()
-    elif page == _PAGES[8]:
-        from tools.dataset_platform.ui.advanced_page import _render_advanced
-        _render_advanced()
+    renderer = load_renderer(page_by_key(page_key))
+    renderer()
 
 
 def _auto_start_fiftyone():
@@ -106,8 +68,10 @@ def main():
 
     _render_sidebar()
     _auto_start_fiftyone()
+    _render_workspace_header()
 
-    active = st.session_state.get("_active_page", _PAGES[0])
+    active = resolve_page_key(st.session_state.get("_active_page", DEFAULT_PAGE_KEY))
+    st.session_state["_active_page"] = active
     _render_active_page(active)
 
 
