@@ -1,4 +1,4 @@
-"""侧边栏：数据集管理与 CVAT 配置。"""
+"""侧边栏：数据集切换、工作流导航与当前数据集摘要。"""
 from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
@@ -9,14 +9,10 @@ from tools.dataset_platform.ui.navigation import PAGE_LABELS, page_by_key, resol
 
 
 def _render_sidebar():
-    st.sidebar.title("📦 数据集管理")
+    st.sidebar.title("📦 工作区")
     _render_dataset_switcher()
     st.sidebar.markdown("---")
     _render_navigation_menu()
-    st.sidebar.markdown("---")
-    _render_dataset_actions()
-    st.sidebar.markdown("---")
-    _render_cvat_settings()
     st.sidebar.markdown("---")
     _render_dataset_summary()
 
@@ -38,6 +34,8 @@ def _render_dataset_switcher():
             ds = _get_ds()
             if ds:
                 dm.switch_session_dataset(ds)
+        port = st.session_state.get("fo_port", CONFIG.fiftyone_port)
+        st.sidebar.link_button("打开 FiftyOne", f"http://localhost:{port}", use_container_width=True)
     else:
         st.sidebar.info("暂无数据集，请先创建")
 
@@ -57,11 +55,11 @@ def _render_navigation_menu():
         st.rerun()
 
 
-def _render_dataset_actions():
+def _render_dataset_actions(container=st):
     """Create, rename, and delete datasets."""
-    st.sidebar.subheader("数据集操作")
+    container.subheader("数据集操作")
 
-    with st.sidebar.expander("➕ 新建数据集"):
+    with container.expander("➕ 新建数据集"):
         new_name = st.text_input("数据集名称", key="new_ds_name")
         if st.button("创建", key="btn_create_ds"):
             if new_name:
@@ -75,7 +73,7 @@ def _render_dataset_actions():
             else:
                 st.warning("请输入名称")
 
-    with st.sidebar.expander("✏️ 重命名数据集"):
+    with container.expander("✏️ 重命名数据集"):
         if st.session_state.current_dataset:
             rename_to = st.text_input(
                 "新名称", value=st.session_state.current_dataset, key="rename_input"
@@ -90,7 +88,7 @@ def _render_dataset_actions():
                     except Exception as e:
                         st.error(f"重命名失败: {e}")
 
-    with st.sidebar.expander("🗑️ 删除数据集"):
+    with container.expander("🗑️ 删除数据集"):
         if st.session_state.current_dataset:
             st.warning(f"即将删除: **{st.session_state.current_dataset}**")
             confirm = st.text_input("输入数据集名称确认删除", key="del_confirm")
@@ -114,9 +112,9 @@ def _render_dataset_actions():
                     st.error("名称不匹配，取消删除")
 
 
-def _render_cvat_settings():
+def _render_cvat_settings(container=st):
     """CVAT connection settings, collapsed away from the main workflow."""
-    with st.sidebar.expander("⚙️ CVAT 配置", expanded=False):
+    with container.expander("⚙️ CVAT 配置", expanded=False):
         CONFIG.cvat.url = st.text_input("CVAT URL", value=CONFIG.cvat.url)
         CONFIG.cvat.username = st.text_input("用户名", value=CONFIG.cvat.username)
         CONFIG.cvat.password = st.text_input("密码", value=CONFIG.cvat.password, type="password")

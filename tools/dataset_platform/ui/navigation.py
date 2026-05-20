@@ -23,9 +23,9 @@ PAGES: tuple[PageSpec, ...] = (
         renderer="tools.dataset_platform.ui.hub:_render_data_hub",
     ),
     PageSpec(
-        key="organize",
-        label="📥 导入与整理",
-        legacy_labels=("📥 数据导入", "🧹 处理清洗"),
+        key="prepare",
+        label="🧰 数据准备",
+        legacy_labels=("organize", "📥 导入与整理", "📥 数据导入", "🧹 处理清洗"),
         renderer="tools.dataset_platform.ui.workflow_pages:_render_import_and_processing",
     ),
     PageSpec(
@@ -47,16 +47,16 @@ PAGES: tuple[PageSpec, ...] = (
         renderer="tools.dataset_platform.ui.workflow_pages:_render_export_and_training",
     ),
     PageSpec(
-        key="quality",
-        label="🔬 质量检查",
-        legacy_labels=("🔬 质量检查",),
-        renderer="tools.dataset_platform.ui.quality_page:_render_quality_page",
+        key="quality_hard",
+        label="🔬 质量与难例",
+        legacy_labels=("quality", "advanced", "🔬 质量检查", "🧠 高级功能", "🧠 高级工具"),
+        renderer="tools.dataset_platform.ui.quality_hard_page:_render_quality_and_hard_samples",
     ),
     PageSpec(
-        key="advanced",
-        label="🧠 高级工具",
-        legacy_labels=("🧠 高级功能",),
-        renderer="tools.dataset_platform.ui.advanced_page:_render_advanced",
+        key="settings",
+        label="⚙️ 设置与管理",
+        legacy_labels=("⚙️ CVAT 配置", "💾 数据集备份", "📦 数据集管理"),
+        renderer="tools.dataset_platform.ui.settings_page:_render_settings_page",
     ),
 )
 

@@ -1111,7 +1111,7 @@ def _render_train_feedback(ds):
                 else:
                     mc2.metric("mAP", "N/A")
                 st.info(
-                    "💡 回灌完成后可前往「高级功能 → 难例挖掘」查找模型表现差的样本，"
+                    "💡 回灌完成后可前往「质量与难例 → 难例挖掘」查找模型表现差的样本，"
                     "然后推送到 CVAT 进行重标注。"
                 )
             except Exception as e:

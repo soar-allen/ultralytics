@@ -322,7 +322,7 @@ def _render_cvat_pull(ds):
     with col_opt2:
         skip_tagging = st.checkbox(
             "跳过自动 Job 状态标签", key="pull_skip_tagging",
-            help="大数据集打标签可能耗时较长，勾选后仅拉取标注不打标签。可稍后在 DataHub 手动刷新。",
+            help="大数据集打标签可能耗时较长，勾选后仅拉取标注不打标签。可稍后在任务状态与审核中手动刷新。",
         )
 
     pull_disabled = not anno_key or (cleanup and not confirm_cleanup)
@@ -343,7 +343,7 @@ def _render_cvat_pull(ds):
                     for tag, count in job_tags.items():
                         st.text(f"  {tag}: {count} 个样本")
                 elif skip_tagging:
-                    st.info("已跳过自动标签，可前往 DataHub 手动刷新 Job 状态标签")
+                    st.info("已跳过自动标签，可在「任务状态与审核」中手动刷新 Job 状态标签")
                 st.json(result)
             except Exception as e:
                 st.error(f"拉取失败: {e}")
@@ -450,6 +450,10 @@ def _render_cvat_review(ds):
 
     st.markdown("---")
 
+    _render_job_tag_refresh(ds, runs)
+
+    st.markdown("---")
+
     # --- 废弃图片管理 ---
     st.markdown("### 🗑️ 废弃图片管理")
     review_field = cvat_sync.REVIEW_FIELD
@@ -502,3 +506,34 @@ def _render_cvat_review(ds):
                             st.rerun()
                     except Exception as e:
                         st.error(f"处理失败: {e}")
+
+
+def _render_job_tag_refresh(ds, runs: list[str]):
+    st.markdown("### 🔄 Job 状态标签刷新")
+    st.caption(
+        "从 CVAT 查询最新 Job 状态并写入样本 Tags，之后可在「数据总览」按状态标签筛选样本。"
+    )
+
+    refresh_keys = st.multiselect(
+        "选择标注运行（最新在前）",
+        runs,
+        default=runs,
+        key="review_refresh_keys",
+        help="选择要刷新状态标签的标注运行",
+    )
+    if st.button("🔄 刷新 Job 状态标签", key="review_refresh_tags"):
+        if not refresh_keys:
+            st.warning("请先选择标注运行")
+            return
+
+        with st.spinner("正在从 CVAT 查询最新 Job 状态并更新标签..."):
+            try:
+                tagged = cvat_sync.tag_samples_by_job_status(ds, refresh_keys)
+                if tagged:
+                    st.success("✅ 标签已更新为最新状态")
+                    for tag, count in tagged.items():
+                        st.text(f"  {tag}: {count} 个样本")
+                else:
+                    st.warning("无法标记：可能缺少 frame_id_map 映射信息")
+            except Exception as e:
+                st.error(f"刷新失败: {e}")

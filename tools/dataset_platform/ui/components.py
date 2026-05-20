@@ -113,32 +113,10 @@ def _render_workspace_header():
     """Render the persistent dataset context at the top of every page."""
     ds = _get_ds()
 
-    if ds is None:
-        st.title("CV 数据集管理平台")
-        st.info("请先在侧边栏选择或创建数据集")
-        return
-
-    info = _get_info(ds)
     st.title("CV 数据集管理平台")
-
-    metric_cols = st.columns([1.4, 1, 1, 1, 1.2])
-    metric_cols[0].metric("当前数据集", ds.name)
-    metric_cols[1].metric("样本数", info["num_samples"])
-    metric_cols[2].metric("标签字段", len(info["label_fields"]))
-    metric_cols[3].metric("Tags", len(info["tags"]))
-
-    port = st.session_state.get("fo_port", CONFIG.fiftyone_port)
-    with metric_cols[4]:
-        st.link_button("打开 FiftyOne", f"http://localhost:{port}", use_container_width=True)
-
-    caption_parts = [
-        f"标签字段: {_format_short_list(info['label_fields'])}",
-        f"样本 Tags: {_format_short_list(info['tags'])}",
-    ]
-    last_yaml = st.session_state.get("last_export_data_yaml")
-    if last_yaml:
-        caption_parts.append(f"最近导出 data.yaml: `{last_yaml}`")
-    st.caption(" | ".join(caption_parts))
+    if ds is None:
+        st.info("请先选择数据集，或在「设置与管理」中新建数据集")
+        return
     st.markdown("---")
 
 

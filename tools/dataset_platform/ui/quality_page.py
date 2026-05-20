@@ -146,6 +146,11 @@ def _render_quality_page():
         st.info("请先选择数据集")
         return
 
+    _render_quality_checks(ds)
+
+
+def _render_quality_checks(ds):
+    """Render annotation quality checks for the provided dataset."""
     info = _get_info(ds)
     label_fields = info.get("label_fields", [])
     if not label_fields:
@@ -470,7 +475,7 @@ def _render_class_balance(ds, label_field: str):
         st.info(
             "新增样本已标记 `oversampled` 标签。\n"
             "复制样本只保留多边形标注，不会复制矩形框标注。\n"
-            "导出训练时请包含所有样本。如需撤销，可在 DataHub 中按 `oversampled` 标签筛选后删除。"
+            "导出训练时请包含所有样本。如需撤销，可在「数据总览」中按 `oversampled` 标签筛选后删除。"
         )
 
 

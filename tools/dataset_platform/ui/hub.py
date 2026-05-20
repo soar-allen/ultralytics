@@ -1,23 +1,22 @@
-"""Data Hub：数据集统计仪表盘、标签筛选、标签管理。"""
+"""数据总览：数据集统计仪表盘、标签筛选、标签管理、健康检查。"""
 from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
-from tools.dataset_platform import cvat_sync
 from tools.dataset_platform.config import CONFIG
 from tools.dataset_platform.ui.components import _get_ds, _get_info
 
 
 def _render_data_hub():
-    st.header("📊 Data Hub - 数据集管理中心")
+    st.header("📊 数据总览")
     ds = _get_ds()
     if ds is None:
-        st.info("请先在侧边栏选择或创建数据集")
+        st.info("请先选择数据集，或在「设置与管理」中新建数据集")
         return
 
     info = _get_info(ds)
 
-    tab_stats, tab_tags_filter, tab_label_mgmt = st.tabs([
-        "📊 数据集统计", "🔎 标签筛选与查看", "🏷️ 标签管理",
+    tab_stats, tab_tags_filter, tab_label_mgmt, tab_health = st.tabs([
+        "📊 概览统计", "🔎 筛选查看", "🏷️ 标签管理", "🩺 健康检查",
     ])
 
     with tab_stats:
@@ -26,6 +25,8 @@ def _render_data_hub():
         _render_hub_tag_filter(ds, info)
     with tab_label_mgmt:
         _render_label_management(ds)
+    with tab_health:
+        _render_hub_health(ds, info)
 
 
 def _render_hub_statistics(ds, info: dict):
@@ -94,8 +95,8 @@ def _render_hub_statistics(ds, info: dict):
     else:
         st.info("当前数据集没有标签字段，请先导入标注数据")
 
-    # --- 修复重复 Tags ---
-    st.markdown("---")
+def _render_hub_health(ds, info: dict):
+    """Dataset health checks and low-frequency maintenance."""
     with st.expander("🔧 修复重复 Tags"):
         st.caption("扫描所有样本，将 tags 列表中的重复项去重（如 `['a','a','b']` → `['a','b']`）。")
         if st.button("🔍 扫描并修复", key="btn_fix_dup_tags"):
@@ -113,7 +114,6 @@ def _render_hub_statistics(ds, info: dict):
             else:
                 st.success("所有样本的 Tags 均无重复，无需修复")
 
-    # --- 数据完整性检查 ---
     st.markdown("---")
     with st.expander("🔍 数据集完整性检查"):
         if st.button("运行检查", key="btn_integrity_check"):
@@ -152,7 +152,6 @@ def _render_hub_statistics(ds, info: dict):
             else:
                 st.success("所有样本的图片文件均存在，数据集完整")
 
-    # --- 数据集元信息 ---
     with st.expander("📋 数据集完整元信息", expanded=False):
         st.json(info)
 
@@ -205,7 +204,7 @@ def _render_hub_tag_filter(ds, info: dict):
                 cvat_url = CONFIG.cvat.url.rstrip("/")
                 st.link_button("🔗 打开 CVAT 面板", f"{cvat_url}/tasks")
             else:
-                st.caption("当前数据集暂无 CVAT 标注运行，需先在「CVAT 同步」中推送数据。")
+                st.caption("当前数据集暂无 CVAT 标注运行，需先在「CVAT 标注同步」中推送数据。")
 
         # 筛选结果的标注统计
         with st.expander("📊 筛选结果统计", expanded=False):
@@ -220,38 +219,6 @@ def _render_hub_tag_filter(ds, info: dict):
                     st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.caption("请在上方选择 Tags 进行筛选")
-
-    # CVAT Job 状态快捷操作
-    st.markdown("---")
-    st.subheader("🔄 CVAT Job 状态标签刷新")
-    st.caption(
-        "如果数据已推送到 CVAT，可以一键从 CVAT 同步最新 Job 状态标签到样本 Tags 中，"
-        "然后通过上方的 Tags 筛选来查看特定状态的样本。"
-    )
-
-    runs = cvat_sync.list_annotation_runs_keys(ds) if hasattr(ds, "list_annotation_runs") else []
-    if runs:
-        refresh_keys = st.multiselect(
-            "选择标注运行（最新在前）", runs, default=runs, key="hub_refresh_keys",
-            help="选择要刷新状态标签的标注运行",
-        )
-        if st.button("🔄 刷新 Job 状态标签", key="hub_refresh_tags"):
-            if refresh_keys:
-                with st.spinner("正在从 CVAT 查询最新 Job 状态并更新标签..."):
-                    try:
-                        tagged = cvat_sync.tag_samples_by_job_status(ds, refresh_keys)
-                        if tagged:
-                            st.success("✅ 标签已更新为最新状态")
-                            for tag, count in tagged.items():
-                                st.text(f"  {tag}: {count} 个样本")
-                        else:
-                            st.warning("无法标记：可能缺少 frame_id_map 映射信息")
-                    except Exception as e:
-                        st.error(f"刷新失败: {e}")
-            else:
-                st.warning("请先选择标注运行")
-    else:
-        st.info("暂无 CVAT 标注运行。推送数据到 CVAT 后可在此刷新 Job 状态标签。")
 
 
 def _render_label_management(ds):
@@ -443,4 +410,3 @@ def _render_label_management(ds):
             list(stats.items()), columns=["类别", "数量"]
         ).sort_values("数量", ascending=False)
         st.dataframe(df, use_container_width=True, hide_index=True)
-

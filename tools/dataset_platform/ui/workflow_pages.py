@@ -6,7 +6,7 @@ import streamlit as st
 
 def _render_import_and_processing():
     """Render ingestion and cleaning as one workflow page."""
-    tab_ingest, tab_process = st.tabs(["📥 数据导入", "🧹 处理清洗"])
+    tab_ingest, tab_process = st.tabs(["📥 导入向导", "🧹 清洗工具箱"])
 
     with tab_ingest:
         from tools.dataset_platform.ui.ingestion import _render_ingestion
@@ -20,7 +20,7 @@ def _render_import_and_processing():
 
 def _render_export_and_training():
     """Render export and training as one workflow page."""
-    tab_export, tab_train = st.tabs(["📤 数据导出", "🏋️ 训练管理"])
+    tab_export, tab_train = st.tabs(["📤 数据交付", "🏋️ 训练与模型"])
 
     with tab_export:
         from tools.dataset_platform.ui.export_page import _render_export
