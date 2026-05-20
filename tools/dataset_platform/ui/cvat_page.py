@@ -162,7 +162,7 @@ def _render_cvat_push(ds):
     available_tags = ds.distinct("tags")
     push_filter_tags = []
     if available_tags:
-        push_filter_tags = st.multiselect("按批次标签筛选（留空 = 不过滤）", available_tags, key="push_filter_tags")
+        push_filter_tags = st.multiselect("按标签筛选（留空 = 不过滤）", available_tags, key="push_filter_tags")
 
     selected_classes = []
     if label_schema is None and label_fields:
@@ -174,7 +174,7 @@ def _render_cvat_push(ds):
 
     col_seg, col_quality = st.columns(2)
     with col_seg:
-        segment_size = st.number_input("每个 Job 图片数", value=200, min_value=10, key="push_seg")
+        segment_size = st.number_input("每个 Job 图片数", value=100, min_value=10, key="push_seg")
     with col_quality:
         image_quality = st.number_input("图像质量", value=100, min_value=1, max_value=100, key="push_img_quality")
 

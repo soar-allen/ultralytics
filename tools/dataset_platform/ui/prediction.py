@@ -3,7 +3,7 @@
 
 支持多种预标注模式：
   1. YOLO Pose → 四角多边形：用关键点检测模型识别四个角点，连接为闭合 Polyline（多类别）
-  2. SAM3 辅助标注：支持 text prompt / box prompt，输出四角多边形或 bbox
+  2. SAM3 辅助标注：支持 text prompt / box prompt，输出 bbox
 """
 from __future__ import annotations
 
@@ -59,8 +59,13 @@ def _model_selector(label: str, key_prefix: str) -> str:
         )
 
 
-def _field_selector(ds, key_prefix: str, default: str = "ground_truth",
-                    field_type_filter: str | None = None) -> str:
+def _field_selector(
+    ds,
+    key_prefix: str,
+    default: str = "ground_truth",
+    field_type_filter: str | None = None,
+    select_existing_default: bool = False,
+) -> str:
     """字段选择器：下拉选择已有字段 / 手动输入新字段。
 
     Args:
@@ -85,8 +90,11 @@ def _field_selector(ds, key_prefix: str, default: str = "ground_truth",
                 continue
         label_fields.append(fn)
 
+    options = ["输入新字段名", "选择已有字段"]
+    default_mode = "选择已有字段" if select_existing_default and default in label_fields else "输入新字段名"
     mode = st.radio(
         "字段来源", ["输入新字段名", "选择已有字段"],
+        index=options.index(default_mode),
         key=f"{key_prefix}_field_mode", horizontal=True,
     )
 
@@ -191,8 +199,14 @@ def _render_pose_mode(ds, info: dict, unlabeled):
 
     with col_config:
         st.subheader("标注配置")
-        pred_field = _field_selector(ds, "pose", default="ground_truth")
-        conf = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05, key="pose_conf")
+        pred_field = _field_selector(
+            ds,
+            "pose",
+            default="pridict_polylines",
+            field_type_filter="polylines",
+            select_existing_default=True,
+        )
+        conf = st.slider("置信度阈值", 0.0, 1.0, 0.5, 0.05, key="pose_conf")
 
     # 类别过滤（可选）
     with st.expander("类别过滤（可选）"):
@@ -244,10 +258,10 @@ def _render_pose_mode(ds, info: dict, unlabeled):
 # -----------------------------------------------------------------------
 
 def _render_sam3_mode(ds, info: dict, unlabeled):
-    """SAM3 辅助标注：三种提示策略，两种输出格式。"""
+    """SAM3 辅助标注：三种提示策略，固定输出矩形框。"""
     st.markdown("### 🎯 SAM3 辅助标注")
     st.caption(
-        "支持三种提示策略和两种输出格式，根据场景选择最佳方案。"
+        "支持三种提示策略，输出格式固定为矩形框 (BBox)。"
     )
 
     col_model, col_output = st.columns(2)
@@ -259,17 +273,20 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
 
     with col_output:
         st.subheader("输出配置")
-        output_mode = st.radio(
-            "输出格式", ["四角多边形 (Polyline)", "矩形框 (BBox)"],
-            key="sam3_output_mode", horizontal=True,
+        st.info("输出格式: 矩形框 (BBox)")
+        is_polyline = False
+        pred_field = _field_selector(
+            ds,
+            "sam3",
+            default="pridict",
+            field_type_filter="detections",
+            select_existing_default=True,
         )
-        is_polyline = output_mode.startswith("四角")
-        pred_field = _field_selector(ds, "sam3", default="predict", field_type_filter=None)
         label_name = st.text_input(
             "输出类别名", value="pallet", key="sam3_label_name",
             help="所有输出标注统一使用此类别名",
         )
-        conf = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05, key="sam3_conf")
+        conf = st.slider("置信度阈值", 0.0, 1.0, 0.5, 0.05, key="sam3_conf")
 
     st.markdown("---")
     st.subheader("提示策略")
