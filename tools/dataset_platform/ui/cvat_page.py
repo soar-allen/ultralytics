@@ -6,7 +6,14 @@ import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import cvat_sync
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _get_ds, _get_info
+from tools.dataset_platform.ui.components import (
+    _cached_label_classes,
+    _cached_tags,
+    _get_ds,
+    _get_info,
+    _invalidate_ui_stats_cache,
+    _primary_action_section,
+)
 
 
 def _render_cvat_sync():
@@ -35,17 +42,21 @@ def _render_cvat_sync():
 2. **拉取** → 选择同一 anno_key → 标注结果自动同步回 FiftyOne 数据集
         """)
 
-    tab_push, tab_pull, tab_manage, tab_review = st.tabs([
-        "📤 推送到 CVAT", "📥 从 CVAT 拉取", "📋 管理标注运行", "🔍 任务状态与审核",
-    ])
+    section = st.radio(
+        "CVAT 模块",
+        ["📤 推送到 CVAT", "📥 从 CVAT 拉取", "📋 管理标注运行", "🔍 任务状态与审核"],
+        key="cvat_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_push:
+    if section.startswith("📤"):
         _render_cvat_push(ds)
-    with tab_pull:
+    elif section.startswith("📥"):
         _render_cvat_pull(ds)
-    with tab_manage:
+    elif section.startswith("📋"):
         _render_cvat_manage(ds)
-    with tab_review:
+    else:
         _render_cvat_review(ds)
 
 
@@ -101,7 +112,7 @@ def _render_cvat_push(ds):
                 field_type_map = {}
                 for f in selected_fields:
                     ftype = dm.get_field_label_type(ds, f)
-                    all_classes = dm.get_label_classes(ds, f)
+                    all_classes = _cached_label_classes(ds, f)
                     type_display = _TYPE_LABELS.get(ftype, ftype or "未知")
                     field_type_map[f] = {"type": ftype, "classes": all_classes, "display": type_display}
                     if ftype == "polylines":
@@ -159,7 +170,7 @@ def _render_cvat_push(ds):
         "推送范围", ["整个数据集", "仅无标注样本", "仅有标注样本"], key="push_mode", horizontal=True,
     )
 
-    available_tags = ds.distinct("tags")
+    available_tags = _cached_tags(ds)
     push_filter_tags = []
     if available_tags:
         push_filter_tags = st.multiselect("按标签筛选（留空 = 不过滤）", available_tags, key="push_filter_tags")
@@ -168,7 +179,7 @@ def _render_cvat_push(ds):
     if label_schema is None and label_fields:
         filter_field = single_label_field if (single_label_field and single_label_field in label_fields) else None
         if filter_field:
-            all_classes = dm.get_label_classes(ds, filter_field)
+            all_classes = _cached_label_classes(ds, filter_field)
             if all_classes:
                 selected_classes = st.multiselect("仅推送以下类别（留空 = 推送全部类别）", all_classes, key="push_classes")
 
@@ -196,7 +207,23 @@ def _render_cvat_push(ds):
         st.info(f"已选 **{len(label_schema)}** 个字段，将逐字段推送到独立 CVAT 任务。")
 
     can_push = label_schema is not None or single_label_field
-    if st.button("📤 推送到 CVAT", key="btn_push", disabled=not can_push):
+    push_summary = {
+        "标注键": anno_key or "未设置",
+        "CVAT 项目": custom_project.strip() or ds.name,
+        "标签字段": list(label_schema.keys()) if label_schema else single_label_field,
+        "推送范围": push_mode,
+        "Tags 筛选": push_filter_tags or "不过滤",
+        "每个 Job 图片数": segment_size,
+        "图像质量": image_quality,
+        "启用废弃标记": "是" if include_review else "否",
+    }
+    if _primary_action_section(
+        "📤 推送到 CVAT",
+        "btn_push",
+        push_summary,
+        disabled=not can_push,
+        disabled_reason="请选择已有标签字段，或输入一个新字段名",
+    ):
         if not anno_key:
             st.error("请输入标注键 (anno_key)")
             return
@@ -326,7 +353,18 @@ def _render_cvat_pull(ds):
         )
 
     pull_disabled = not anno_key or (cleanup and not confirm_cleanup)
-    if st.button("📥 拉取标注", key="btn_pull", disabled=pull_disabled):
+    pull_summary = {
+        "标注运行": anno_key or "未选择",
+        "拉取后删除 CVAT 端任务": "是" if cleanup else "否",
+        "跳过自动 Job 状态标签": "是" if skip_tagging else "否",
+    }
+    if _primary_action_section(
+        "📥 拉取标注",
+        "btn_pull",
+        pull_summary,
+        disabled=pull_disabled,
+        disabled_reason="请选择标注运行，并完成必要的危险操作确认",
+    ):
         if not anno_key:
             st.error("请选择标注运行")
             return
@@ -336,6 +374,7 @@ def _render_cvat_pull(ds):
                 result = cvat_sync.pull_from_cvat(
                     ds, anno_key, cleanup=cleanup, skip_tagging=skip_tagging,
                 )
+                _invalidate_ui_stats_cache()
                 st.success("✅ 拉取成功，标注已同步到数据集")
                 job_tags = result.get("job_tags", {})
                 if job_tags:
@@ -500,6 +539,7 @@ def _render_cvat_review(ds):
                 with st.spinner("处理中..."):
                     try:
                         result = cvat_sync.handle_discarded_samples(ds, review_field, action=action, tag_name=tag_name)
+                        _invalidate_ui_stats_cache()
                         st.success(f"✅ 处理完成：{result['action']} 了 {result['count']} 个样本")
                         if action != "tag":
                             st.session_state["_toast_msg"] = f"已处理 {result['count']} 个废弃样本"
@@ -529,6 +569,7 @@ def _render_job_tag_refresh(ds, runs: list[str]):
         with st.spinner("正在从 CVAT 查询最新 Job 状态并更新标签..."):
             try:
                 tagged = cvat_sync.tag_samples_by_job_status(ds, refresh_keys)
+                _invalidate_ui_stats_cache()
                 if tagged:
                     st.success("✅ 标签已更新为最新状态")
                     for tag, count in tagged.items():

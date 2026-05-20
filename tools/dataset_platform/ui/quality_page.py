@@ -159,17 +159,23 @@ def _render_quality_checks(ds):
 
     label_field = st.selectbox("选择标签字段", label_fields, key="qa_label_field")
 
-    tab_balance, tab_area, tab_empty, tab_consistency = st.tabs([
-        "📊 类别平衡", "📐 面积分析", "🔲 空标注检测", "🔍 标注一致性",
-    ])
+    sections = ["📊 类别平衡", "📐 面积分析", "🔲 空标注检测", "🔍 标注一致性"]
+    section = st.radio(
+        "质量检查模块",
+        sections,
+        index=1,
+        key="quality_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_balance:
+    if section.startswith("📊"):
         _render_class_balance(ds, label_field)
-    with tab_area:
+    elif section.startswith("📐"):
         _render_area_analysis(ds, label_field)
-    with tab_empty:
+    elif section.startswith("🔲"):
         _render_empty_annotations(ds, label_field)
-    with tab_consistency:
+    else:
         _render_annotation_consistency(ds, label_field)
 
 

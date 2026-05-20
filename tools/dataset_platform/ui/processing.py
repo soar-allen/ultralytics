@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import processor
-from tools.dataset_platform.ui.components import _get_ds, _get_info
+from tools.dataset_platform.ui.components import _get_ds, _get_info, _invalidate_ui_stats_cache
 
 
 # ===================================================================
@@ -17,13 +17,17 @@ def _render_processing():
         st.info("请先选择数据集")
         return
 
-    tab_clean, tab_field_mgmt = st.tabs(
+    section = st.radio(
+        "处理清洗模块",
         ["🧹 图像清理", "🗂️ 字段管理"],
+        key="processing_section",
+        horizontal=True,
+        label_visibility="collapsed",
     )
 
-    with tab_clean:
+    if section.startswith("🧹"):
         _render_cleaning(ds)
-    with tab_field_mgmt:
+    else:
         _render_field_management(ds)
 
 
@@ -186,11 +190,14 @@ def _render_cleaning(ds):
 
     with col1:
         st.subheader("无标注图像")
-        unlabeled = processor.find_unlabeled_samples(ds)
-        unlabeled_count = len(unlabeled)
-        st.metric("无标注样本数", unlabeled_count)
+        unlabeled_key = f"clean_unlabeled_count_{ds.name}"
+        if st.button("🔍 扫描无标注样本", key="btn_scan_unlabeled", use_container_width=True):
+            with st.spinner("正在扫描无标注样本..."):
+                st.session_state[unlabeled_key] = len(processor.find_unlabeled_samples(ds))
+        unlabeled_count = st.session_state.get(unlabeled_key)
+        st.metric("无标注样本数", unlabeled_count if unlabeled_count is not None else "未扫描")
         physical = st.checkbox("同时删除磁盘文件", key="clean_unlabeled_physical")
-        if unlabeled_count > 0:
+        if unlabeled_count and unlabeled_count > 0:
             confirm_del_unlabeled = st.checkbox(
                 f"⚠️ 确认删除 {unlabeled_count} 个无标注样本", key="confirm_del_unlabeled",
             )
@@ -200,6 +207,8 @@ def _render_cleaning(ds):
                      disabled=not confirm_del_unlabeled):
             with st.spinner("删除中..."):
                 count = processor.delete_unlabeled_samples(ds, physical=physical)
+            _invalidate_ui_stats_cache()
+            st.session_state.pop(unlabeled_key, None)
             st.success(f"✅ 删除 {count} 个样本")
             st.rerun()
 

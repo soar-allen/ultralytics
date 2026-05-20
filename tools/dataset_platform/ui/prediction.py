@@ -14,7 +14,16 @@ import streamlit as st
 
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import processor
-from tools.dataset_platform.ui.components import _get_ds, _get_info, _path_browser
+from tools.dataset_platform.ui.components import (
+    _cached_label_classes,
+    _cached_tags,
+    _get_ds,
+    _get_info,
+    _invalidate_ui_stats_cache,
+    _path_browser,
+    _primary_action_section,
+    _render_scope_selector as _common_scope_selector,
+)
 
 _MODEL_DIR = Path.home() / ".dataset_platform" / "model"
 _MODEL_EXTENSIONS = (".pt", ".pth", ".onnx", ".engine")
@@ -114,31 +123,21 @@ def _field_selector(
 
 def _render_scope_selector(ds, unlabeled_view, pred_field: str, skip_labeled: bool):
     """预标注范围选择，返回 (view_or_none, display_count)。"""
-    pred_scope = st.radio(
-        "选择范围", ["仅无标注样本", "整个数据集", "按 Tags 筛选"],
-        key="pred_scope", horizontal=True,
+    pred_view, pred_scope, _ = _common_scope_selector(
+        ds,
+        "pred",
+        label="选择范围",
+        include_unlabeled=True,
+        unlabeled_view=unlabeled_view,
+        label_field=pred_field,
+        default="仅无标注样本",
+        show_count=False,
     )
-
-    pred_view = None
-    if pred_scope == "仅无标注样本":
-        pred_view = unlabeled_view
-        st.info(f"将对 **{len(pred_view)}** 个无标注样本进行预标注")
-    elif pred_scope == "按 Tags 筛选":
-        available_tags = ds.distinct("tags")
-        if available_tags:
-            pred_tags = st.multiselect("选择 Tags", available_tags, key="pred_tags")
-            if pred_tags:
-                pred_view = ds.match_tags(pred_tags)
-                st.info(f"将对 **{len(pred_view)}** 个匹配样本进行预标注")
-        else:
-            st.info("当前数据集没有 Tags")
-    else:
-        st.info(f"将对整个数据集的 **{len(ds)}** 个样本进行预标注")
 
     if skip_labeled and pred_scope != "仅无标注样本":
         st.caption("已启用去重：目标字段中已有标注的样本将被自动跳过")
 
-    return pred_view
+    return pred_view if pred_scope != "整个数据集" else None
 
 
 def _render_auto_predict_page():
@@ -160,8 +159,11 @@ def _render_auto_predict_page():
     with col_overview:
         st.metric("📷 数据集样本数", info["num_samples"])
     with col_unlabeled:
-        unlabeled = processor.find_unlabeled_samples(ds)
-        st.metric("🔲 无标注样本数", len(unlabeled))
+        stat_key = f"pred_unlabeled_count_{ds.name}"
+        if st.button("刷新无标注统计", key="btn_pred_refresh_unlabeled", use_container_width=True):
+            with st.spinner("正在统计无标注样本..."):
+                st.session_state[stat_key] = len(processor.find_unlabeled_samples(ds))
+        st.metric("🔲 无标注样本数", st.session_state.get(stat_key, "未计算"))
 
     st.markdown("---")
 
@@ -172,11 +174,11 @@ def _render_auto_predict_page():
     )
 
     if mode.startswith("🦴"):
-        _render_pose_mode(ds, info, unlabeled)
+        _render_pose_mode(ds, info, None)
     elif mode.startswith("🎯"):
-        _render_sam3_mode(ds, info, unlabeled)
+        _render_sam3_mode(ds, info, None)
     else:
-        _render_sam3_tag_mode(ds, info, unlabeled)
+        _render_sam3_tag_mode(ds, info, None)
 
 
 # -----------------------------------------------------------------------
@@ -236,12 +238,23 @@ def _render_pose_mode(ds, info: dict, unlabeled):
     pred_view = _render_scope_selector(ds, unlabeled, pred_field, skip_labeled)
 
     st.markdown("---")
-    if st.button("🚀 开始 Pose 预标注", key="btn_pose_predict", type="primary"):
-        if not model_path or not Path(model_path).exists():
-            st.error("请选择有效的模型权重文件")
-            return
+    target = pred_view if pred_view is not None else None
+    can_run = bool(model_path and Path(model_path).exists())
+    if _primary_action_section(
+        "🚀 开始 Pose 预标注",
+        "btn_pose_predict",
+        {
+            "模型": model_path,
+            "输出字段": pred_field,
+            "处理样本": "执行时统计",
+            "跳过已有标注": "是" if skip_labeled else "否",
+            "NMS IoU": nms_iou,
+            "类别过滤": filter_classes or "全部",
+        },
+        disabled=not can_run,
+        disabled_reason="请选择有效的模型权重文件",
+    ):
 
-        target = pred_view if pred_view is not None else None
         target_count = len(target) if target is not None else len(ds)
         with st.spinner(f"使用 YOLO Pose 模型对 {target_count} 个样本检测四角多边形..."):
             stats = processor.auto_predict_pose_to_polyline(
@@ -249,6 +262,7 @@ def _render_pose_mode(ds, info: dict, unlabeled):
                 conf_threshold=conf, filter_classes=filter_classes,
                 skip_labeled=skip_labeled, nms_iou=nms_iou, view=target,
             )
+        _invalidate_ui_stats_cache()
         st.success("Pose 预标注完成")
         _show_predict_stats(stats)
 
@@ -419,10 +433,36 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
     pred_view = _render_scope_selector(ds, unlabeled, pred_field, skip_labeled)
 
     st.markdown("---")
-    if st.button("🚀 开始 SAM3 预标注", key="btn_sam3_predict", type="primary"):
-        if not model_path or not Path(model_path).exists():
-            st.error("请选择有效的模型权重文件")
-            return
+    target = pred_view if pred_view is not None else None
+    strategy_names = {
+        "text": "文本概念", "box_example": "图像范例",
+        "combined": "联合提示", "box_visual": "视觉分割",
+    }
+    disabled_reason = ""
+    if not model_path or not Path(model_path).exists():
+        disabled_reason = "请选择有效的模型权重文件"
+    elif p_mode == "text" and not text_prompts:
+        disabled_reason = "请输入至少一个文本提示"
+    elif p_mode == "combined" and not text_prompts and not box_source_field:
+        disabled_reason = "联合提示模式需要至少提供文本提示或来源字段之一"
+    elif p_mode in ("box_example", "box_visual") and not box_source_field:
+        disabled_reason = "请选择来源字段"
+
+    if _primary_action_section(
+        "🚀 开始 SAM3 预标注",
+        "btn_sam3_predict",
+        {
+            "模型": model_path,
+            "提示策略": strategy_names[p_mode],
+            "输出字段": pred_field,
+            "输出类别": label_name,
+            "处理样本": "执行时统计",
+            "跳过已有标注": "是" if skip_labeled else "否",
+            "失败标签": fail_tag.strip() or "不打标签",
+        },
+        disabled=bool(disabled_reason),
+        disabled_reason=disabled_reason,
+    ):
         if p_mode == "text" and not text_prompts:
             st.error("请输入至少一个文本提示")
             return
@@ -434,13 +474,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
             return
 
         o_mode = "polyline" if is_polyline else "bbox"
-        target = pred_view if pred_view is not None else None
         target_count = len(target) if target is not None else len(ds)
-
-        strategy_names = {
-            "text": "文本概念", "box_example": "图像范例",
-            "combined": "联合提示", "box_visual": "视觉分割",
-        }
         with st.spinner(f"使用 SAM3 ({strategy_names[p_mode]} → {o_mode}) 对 {target_count} 个样本标注..."):
             stats = processor.auto_predict_sam3(
                 ds, model_path,
@@ -461,6 +495,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
                 view=target,
                 half=half,
             )
+        _invalidate_ui_stats_cache()
         st.success("SAM3 预标注完成")
         _show_predict_stats(stats)
 
@@ -553,33 +588,35 @@ def _render_sam3_tag_mode(ds, info: dict, unlabeled):
     st.markdown("---")
     st.subheader("识别范围")
 
-    tag_scope = st.radio(
-        "选择范围", ["整个数据集", "按 Tags 筛选"],
-        key="sam3_tag_scope", horizontal=True,
+    tag_view, tag_scope, _ = _common_scope_selector(
+        ds,
+        "sam3_tag_filter",
+        label="选择范围",
+        default="整个数据集",
+        show_count=False,
     )
-    tag_view = None
-    if tag_scope == "按 Tags 筛选":
-        available_tags = ds.distinct("tags")
-        if available_tags:
-            sel_tags = st.multiselect("选择 Tags", available_tags, key="sam3_tag_filter_tags")
-            if sel_tags:
-                tag_view = ds.match_tags(sel_tags)
-                st.info(f"将对 **{len(tag_view)}** 个匹配样本进行识别")
-        else:
-            st.info("当前数据集没有 Tags")
-    else:
-        st.info(f"将对整个数据集的 **{len(ds)}** 个样本进行识别")
 
     st.markdown("---")
-    if st.button("🚀 开始 SAM3 标签识别", key="btn_sam3_tag_start", type="primary"):
-        if not model_path or not Path(model_path).exists():
-            st.error("请选择有效的模型权重文件")
-            return
-        if not text_prompts and not box_source_field:
-            st.error("请至少提供文本提示或来源字段之一")
-            return
+    target = tag_view if tag_scope != "整个数据集" else None
+    disabled_reason = ""
+    if not model_path or not Path(model_path).exists():
+        disabled_reason = "请选择有效的模型权重文件"
+    elif not text_prompts and not box_source_field:
+        disabled_reason = "请至少提供文本提示或来源字段之一"
 
-        target = tag_view if tag_view is not None else None
+    if _primary_action_section(
+        "🚀 开始 SAM3 标签识别",
+        "btn_sam3_tag_start",
+        {
+            "模型": model_path,
+            "处理样本": "执行时统计",
+            "识别成功标签": found_tag.strip() or "未设置",
+            "未识别标签": not_found_tag.strip() or "不打标签",
+            "失败标签": fail_tag.strip() or "不打标签",
+        },
+        disabled=bool(disabled_reason),
+        disabled_reason=disabled_reason,
+    ):
         target_count = len(target) if target is not None else len(ds)
         with st.spinner(f"使用 SAM3 对 {target_count} 个样本进行目标识别..."):
             stats = processor.auto_tag_sam3(
@@ -596,6 +633,7 @@ def _render_sam3_tag_mode(ds, info: dict, unlabeled):
                 view=target,
                 half=half,
             )
+        _invalidate_ui_stats_cache()
         st.success("SAM3 标签识别完成")
 
         col_s1, col_s2, col_s3, col_s4 = st.columns(4)
@@ -623,7 +661,7 @@ def _render_box_source_selector(ds, key_prefix: str = "sam3") -> tuple:
     import fiftyone as fo
 
     # 来源标签（按 tags 筛选哪些样本的标注作为范例来源）
-    available_tags = ds.distinct("tags")
+    available_tags = _cached_tags(ds)
     box_source_tags: list[str] = []
     if available_tags:
         box_source_tags = st.multiselect(
@@ -651,7 +689,7 @@ def _render_box_source_selector(ds, key_prefix: str = "sam3") -> tuple:
             "来源字段（包含已有 Polyline/Detection）", source_fields,
             key=f"{key_prefix}_box_field",
         )
-        classes = dm.get_label_classes(ds, box_source_field) if box_source_field else []
+        classes = _cached_label_classes(ds, box_source_field) if box_source_field else []
         if classes:
             selected = st.multiselect(
                 "来源类别（选择用作范例的类别，不选则使用全部类别）",
@@ -696,7 +734,7 @@ def _show_predict_stats(stats: dict):
 
 def _render_clear_tag_section(ds):
     """清除失败标签的功能区。"""
-    available_tags = ds.distinct("tags")
+    available_tags = _cached_tags(ds)
     if not available_tags:
         st.caption("当前数据集无任何标签")
         return
@@ -714,5 +752,6 @@ def _render_clear_tag_section(ds):
         ):
             with st.spinner(f"正在从 {tagged_count} 个样本中清除标签..."):
                 cleared = processor.clear_tag_from_dataset(ds, tag_to_clear)
+            _invalidate_ui_stats_cache()
             st.success(f"已从 {cleared} 个样本中清除标签 「{tag_to_clear}」")
             st.rerun()

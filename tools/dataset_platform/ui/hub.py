@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _get_ds, _get_info
+from tools.dataset_platform.ui.components import _cached_label_stats, _get_ds, _get_info
 
 
 def _render_data_hub():
@@ -15,17 +15,21 @@ def _render_data_hub():
 
     info = _get_info(ds)
 
-    tab_stats, tab_tags_filter, tab_label_mgmt, tab_health = st.tabs([
-        "📊 概览统计", "🔎 筛选查看", "🏷️ 标签管理", "🩺 健康检查",
-    ])
+    section = st.radio(
+        "数据总览模块",
+        ["📊 概览统计", "🔎 筛选查看", "🏷️ 标签管理", "🩺 健康检查"],
+        key="hub_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_stats:
+    if section.startswith("📊"):
         _render_hub_statistics(ds, info)
-    with tab_tags_filter:
+    elif section.startswith("🔎"):
         _render_hub_tag_filter(ds, info)
-    with tab_label_mgmt:
+    elif section.startswith("🏷️"):
         _render_label_management(ds)
-    with tab_health:
+    else:
         _render_hub_health(ds, info)
 
 
@@ -40,7 +44,7 @@ def _render_hub_statistics(ds, info: dict):
     col_m3.metric("🔖 Tags 种类", len(info["tags"]))
     total_labels = 0
     for lf in info["label_fields"]:
-        stats = dm.get_label_stats(ds, lf)
+        stats = _cached_label_stats(ds, lf)
         total_labels += sum(stats.values()) if stats else 0
     col_m4.metric("📝 标注实例总数", total_labels)
 
@@ -50,7 +54,7 @@ def _render_hub_statistics(ds, info: dict):
 
     available_tags = info["tags"]
     if available_tags:
-        tag_counts = {t: len(ds.match_tags(t)) for t in available_tags}
+        tag_counts = ds.count_values("tags")
         if tag_counts:
             df_tags = pd.DataFrame(
                 list(tag_counts.items()), columns=["标签", "样本数"]
@@ -78,7 +82,7 @@ def _render_hub_statistics(ds, info: dict):
             type_display = {"detections": "矩形框", "polylines": "多边形",
                             "keypoints": "关键点", "classifications": "分类"}.get(field_type, field_type or "未知")
             with st.expander(f"**`{lf}`** — {type_display}", expanded=len(info["label_fields"]) <= 3):
-                stats = dm.get_label_stats(ds, lf)
+                stats = _cached_label_stats(ds, lf)
                 if stats:
                     df = pd.DataFrame(
                         list(stats.items()), columns=["类别", "数量"]

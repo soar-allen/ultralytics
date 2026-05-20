@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 from pathlib import Path
+from typing import Callable
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform.config import CONFIG
@@ -96,6 +97,67 @@ def _get_info(ds):
 
 
 # ===================================================================
+# Session 级 UI 统计缓存
+# ===================================================================
+
+_UI_CACHE_EPOCH_KEY = "__ui_stats_cache_epoch__"
+_UI_STATS_CACHE_KEY = "__ui_stats_cache__"
+
+
+def _ui_cache_epoch() -> int:
+    if _UI_CACHE_EPOCH_KEY not in st.session_state:
+        st.session_state[_UI_CACHE_EPOCH_KEY] = 0
+    return st.session_state[_UI_CACHE_EPOCH_KEY]
+
+
+def _invalidate_ui_stats_cache():
+    """Invalidate cached UI stats after data-changing operations."""
+    st.session_state[_UI_CACHE_EPOCH_KEY] = st.session_state.get(_UI_CACHE_EPOCH_KEY, 0) + 1
+    st.session_state[_UI_STATS_CACHE_KEY] = {}
+
+
+def _ui_cached(ds, key: str, compute: Callable[[], object]):
+    """Cache heavier UI-only stats across reruns for the current dataset."""
+    cache = st.session_state.setdefault(_UI_STATS_CACHE_KEY, {})
+    full_key = (ds.name if ds is not None else "", _ui_cache_epoch(), key)
+    if full_key not in cache:
+        cache[full_key] = compute()
+    return cache[full_key]
+
+
+def _cached_tags(ds) -> list[str]:
+    """Return sorted sample tags using session-level cache."""
+    if ds is None:
+        return []
+    return _ui_cached(ds, "tags", lambda: sorted(ds.distinct("tags")))
+
+
+def _cached_label_classes(ds, field_name: str) -> list[str]:
+    """Return classes for a label field using session-level cache."""
+    if ds is None or not field_name:
+        return []
+    return _ui_cached(ds, f"classes:{field_name}", lambda: dm.get_label_classes(ds, field_name))
+
+
+def _cached_label_stats(ds, field_name: str) -> dict:
+    """Return per-class counts for a label field using session-level cache."""
+    if ds is None or not field_name:
+        return {}
+    return _ui_cached(ds, f"stats:{field_name}", lambda: dm.get_label_stats(ds, field_name))
+
+
+def _default_label_field(ds, label_fields: list[str] | tuple[str, ...], preferred: str = "ground_truth", label_type: str | None = None) -> str:
+    """Choose a stable default label field with optional type filtering."""
+    fields = list(label_fields)
+    if label_type:
+        typed = [f for f in fields if dm.get_field_label_type(ds, f) == label_type]
+        fields = typed or fields
+    if preferred in fields:
+        return preferred
+    return fields[0] if fields else preferred
+
+
+# ===================================================================
 # 通用 UI 组件：工作区摘要、操作摘要、危险操作确认
 # ===================================================================
 
@@ -145,6 +207,66 @@ def _result_panel(result: dict | list | str, title: str = "执行结果"):
             st.json(result)
         else:
             st.write(result)
+
+
+def _primary_action_section(
+    button_label: str,
+    key: str,
+    summary: dict[str, object] | None = None,
+    disabled: bool = False,
+    disabled_reason: str | None = None,
+) -> bool:
+    """Render a consistent pre-action summary and primary button."""
+    if summary:
+        _action_summary("执行前确认", summary, expanded=True)
+    if disabled and disabled_reason:
+        st.warning(disabled_reason)
+    return st.button(button_label, key=key, type="primary", disabled=disabled, use_container_width=True)
+
+
+def _render_scope_selector(
+    ds,
+    key_prefix: str,
+    *,
+    label: str = "操作范围",
+    include_unlabeled: bool = False,
+    unlabeled_view=None,
+    label_field: str | None = None,
+    default: str = "整个数据集",
+    show_count: bool = True,
+):
+    """Render a reusable dataset scope selector and return (view, mode, selected_tags)."""
+    options = ["整个数据集"]
+    if include_unlabeled:
+        options.append("仅无标注样本")
+    options.append("按 Tags 筛选")
+    index = options.index(default) if default in options else 0
+
+    mode = st.radio(label, options, index=index, key=f"{key_prefix}_scope", horizontal=True)
+    selected_tags: list[str] = []
+    view = ds
+
+    if mode == "仅无标注样本":
+        if unlabeled_view is not None:
+            view = unlabeled_view
+        elif label_field:
+            view = dm.get_unlabeled_view(ds, label_field)
+        else:
+            view = ds
+    elif mode == "按 Tags 筛选":
+        tags = _cached_tags(ds)
+        if tags:
+            selected_tags = st.multiselect("选择 Tags", tags, key=f"{key_prefix}_tags")
+            if selected_tags:
+                view = ds.match_tags(selected_tags)
+        else:
+            st.info("当前数据集没有 Tags")
+
+    if show_count:
+        st.caption(f"当前范围: **{len(view)}** 个样本")
+    else:
+        st.caption("当前范围会在执行时统计样本数")
+    return view, mode, selected_tags
 
 
 # ===================================================================

@@ -15,13 +15,17 @@ def _render_quality_and_hard_samples():
         st.info("请先选择数据集")
         return
 
-    tab_quality, tab_hard, tab_brain = st.tabs([
-        "🔬 标注质量", "🎯 难例挖掘", "🧬 FiftyOne Brain",
-    ])
+    section = st.radio(
+        "质量与难例模块",
+        ["🔬 标注质量", "🎯 难例挖掘", "🧬 FiftyOne Brain"],
+        key="quality_hard_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_quality:
+    if section.startswith("🔬"):
         _render_quality_checks(ds)
-    with tab_hard:
+    elif section.startswith("🎯"):
         _render_hard_mining(ds)
-    with tab_brain:
+    else:
         _render_brain(ds)

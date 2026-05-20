@@ -11,17 +11,19 @@ from tools.dataset_platform.ui.sidebar import _render_cvat_settings, _render_dat
 def _render_settings_page():
     st.header("⚙️ 设置与管理")
 
-    tab_dataset, tab_cvat, tab_backup = st.tabs([
-        "📦 数据集操作", "🔗 CVAT 配置", "💾 备份恢复",
-    ])
+    section = st.radio(
+        "设置管理模块",
+        ["📦 数据集操作", "🔗 CVAT 配置", "💾 备份恢复"],
+        key="settings_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_dataset:
+    if section.startswith("📦"):
         _render_dataset_actions(st)
-
-    with tab_cvat:
+    elif section.startswith("🔗"):
         _render_cvat_settings(st)
-
-    with tab_backup:
+    else:
         ds = _get_ds()
         if ds is None:
             st.info("请先选择数据集")

@@ -35,19 +35,23 @@ def _render_training_page():
         st.info("请先选择数据集")
         return
 
-    tab_train, tab_progress, tab_convert, tab_predict, tab_feedback = st.tabs([
-        "🚀 训练配置与启动", "📊 训练进度与历史", "🔁 模型格式转换", "🔮 通用预测", "🔄 训练后回灌",
-    ])
+    section = st.radio(
+        "训练模块",
+        ["🚀 训练配置与启动", "📊 训练进度与历史", "🔁 模型格式转换", "🔮 通用预测", "🔄 训练后回灌"],
+        key="training_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_train:
+    if section.startswith("🚀"):
         _render_train_config(ds)
-    with tab_progress:
+    elif section.startswith("📊"):
         _render_progress_and_history(ds)
-    with tab_convert:
+    elif section.startswith("🔁"):
         _render_model_export(ds)
-    with tab_predict:
+    elif section.startswith("🔮"):
         _render_predict(ds)
-    with tab_feedback:
+    else:
         _render_train_feedback(ds)
 
 

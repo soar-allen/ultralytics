@@ -6,13 +6,19 @@ import streamlit as st
 
 def _render_import_and_processing():
     """Render ingestion and cleaning as one workflow page."""
-    tab_ingest, tab_process = st.tabs(["📥 导入向导", "🧹 清洗工具箱"])
+    section = st.radio(
+        "数据准备模块",
+        ["📥 导入向导", "🧹 清洗工具箱"],
+        key="prepare_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_ingest:
+    if section.startswith("📥"):
         from tools.dataset_platform.ui.ingestion import _render_ingestion
 
         _render_ingestion()
-    with tab_process:
+    else:
         from tools.dataset_platform.ui.processing import _render_processing
 
         _render_processing()
@@ -20,13 +26,19 @@ def _render_import_and_processing():
 
 def _render_export_and_training():
     """Render export and training as one workflow page."""
-    tab_export, tab_train = st.tabs(["📤 数据交付", "🏋️ 训练与模型"])
+    section = st.radio(
+        "导出训练模块",
+        ["📤 数据交付", "🏋️ 训练与模型"],
+        key="export_train_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    with tab_export:
+    if section.startswith("📤"):
         from tools.dataset_platform.ui.export_page import _render_export
 
         _render_export()
-    with tab_train:
+    else:
         from tools.dataset_platform.ui.training_page import _render_training_page
 
         _render_training_page()

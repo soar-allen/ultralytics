@@ -9,7 +9,15 @@ from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import exporter
 from tools.dataset_platform import trainer
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _get_ds, _get_info, _path_browser
+from tools.dataset_platform.ui.components import (
+    _cached_label_classes,
+    _cached_tags,
+    _default_label_field,
+    _get_ds,
+    _get_info,
+    _path_browser,
+    _primary_action_section,
+)
 
 
 def _render_export():
@@ -41,10 +49,15 @@ def _render_export():
     if is_images_only:
         st.info("仅导出图片文件，不包含标签和 data.yaml，不进行数据划分")
 
-    output_dir = _path_browser("输出目录", "export_dir", mode="dir", start_dir=CONFIG.default_export_dir)
+    output_dir = _path_browser(
+        "输出目录",
+        "export_dir",
+        mode="dir",
+        start_dir=st.session_state.get("last_export_dir", CONFIG.default_export_dir),
+    )
 
     # ── Tag 筛选（所有格式通用） ──
-    all_tags = sorted(ds.distinct("tags"))
+    all_tags = _cached_tags(ds)
     selected_tags = []
     if all_tags:
         selected_tags = st.multiselect("按 Tag 筛选样本（留空导出全部）", all_tags, key="export_tags")
@@ -113,10 +126,17 @@ def _render_export():
             splits = single_split
 
         info = _get_info(ds)
+        label_fields = info.get("label_fields", ["ground_truth"])
         label_field_label = "四边形字段" if format_choice == "YOLO 混合训练（pose）" else "标签字段"
-        label_field = st.selectbox(label_field_label, info.get("label_fields", ["ground_truth"]), key="export_label_field")
+        default_field = _default_label_field(
+            ds,
+            label_fields,
+            label_type="polylines" if format_choice in {"YOLO 混合训练（pose）", "YOLO Pose (四边形转关键点)"} else None,
+        )
+        default_idx = label_fields.index(default_field) if default_field in label_fields else 0
+        label_field = st.selectbox(label_field_label, label_fields, index=default_idx, key="export_label_field")
 
-        all_classes = dm.get_label_classes(ds, label_field)
+        all_classes = _cached_label_classes(ds, label_field)
         if all_classes and format_choice != "YOLO 混合训练（pose）":
             selected_classes = st.multiselect("选择导出类别（留空导出全部）", all_classes, key="export_classes")
 
@@ -139,7 +159,6 @@ def _render_export():
 
         if format_choice == "YOLO 混合训练（pose）":
             st.markdown("**混合训练参数**")
-            label_fields = info.get("label_fields", ["ground_truth"])
             detection_fields = [f for f in label_fields if dm.get_field_label_type(ds, f) == "detections"]
             mixed_det_field = st.selectbox(
                 "检测框字段",
@@ -168,7 +187,7 @@ def _render_export():
                     key="export_mixed_bbox_margin",
                 )
             pose_classes = all_classes
-            det_all_classes = dm.get_label_classes(ds, mixed_det_field)
+            det_all_classes = _cached_label_classes(ds, mixed_det_field)
             det_classes = [c for c in det_all_classes if not mixed_detection_classes or c in mixed_detection_classes]
             combined_classes = sorted(set(pose_classes + det_classes))
             if combined_classes:
@@ -192,10 +211,33 @@ def _render_export():
         if isinstance(splits, dict) and split_mode == "按比例自动划分" and total_pct != 100:
             can_export = False
 
-    if st.button("📦 开始导出", key="btn_export", disabled=not can_export):
-        if not output_dir:
-            st.error("请指定输出目录")
-            return
+    disabled_reason = ""
+    if not output_dir:
+        disabled_reason = "请指定输出目录"
+    elif not can_export:
+        disabled_reason = "请调整数据划分比例，总和需要为 100%"
+
+    summary = {
+        "导出格式": format_choice,
+        "输出目录": output_dir,
+        "样本范围": f"{len(export_view)} 个样本",
+        "Tags 筛选": selected_tags or "全部",
+    }
+    if not is_images_only:
+        summary.update({
+            "标签字段": label_field,
+            "导出类别": selected_classes or "全部",
+            "数据划分": splits,
+            "类别顺序锁定": class_order_yaml or "未启用",
+        })
+
+    if _primary_action_section(
+        "📦 开始导出",
+        "btn_export",
+        summary,
+        disabled=bool(disabled_reason),
+        disabled_reason=disabled_reason,
+    ):
 
         with st.spinner("导出中..."):
             try:
