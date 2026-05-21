@@ -7,14 +7,13 @@ from pathlib import Path
 
 import streamlit as st
 
-from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import exporter
 from tools.dataset_platform import trainer
-from tools.dataset_platform.config import CONFIG
 from tools.dataset_platform.ui.components import _get_ds, _path_browser
 
 _BASE_MODEL_DIR = Path.home() / ".dataset_platform" / "base_model"
-_DEFAULT_DATA_YAML = "/home/cotek/datasets/temp/data.yaml"
+_DATA_TRAIN_DIR = Path(__file__).resolve().parents[3] / "data_train"
+_DEFAULT_DATA_YAML = str(_DATA_TRAIN_DIR / "data.yaml")
 
 
 def _list_base_models() -> list[str]:
@@ -67,8 +66,6 @@ def _render_train_config(ds):
 
     st.markdown("---")
 
-    auto_yaml = st.session_state.get("last_export_data_yaml", "")
-
     # ═══════════════════ 模型配置 & 数据配置 并排 ═══════════════════
     col_model, col_data = st.columns(2)
 
@@ -114,42 +111,26 @@ def _render_train_config(ds):
         )
 
         _default_project = f"/home/cotek/ws_cotek/ultralytics/runs/{task}"
-        project_source = st.radio(
-            "训练输出目录", ["默认路径", "自定义路径"],
-            key="train_project_source", horizontal=True,
+        project_dir = _path_browser(
+            "输出目录 (project)",
+            f"train_project_{task}",
+            mode="directory",
+            start_dir=_default_project,
+            default_value=_default_project,
         )
-        if project_source == "默认路径":
-            project_dir = st.text_input(
-                "输出目录 (project)", value=_default_project, key=f"train_project_{task}",
-                help=f"默认: `{_default_project}`，训练产出保存在此目录下",
-            )
-        else:
-            project_dir = _path_browser(
-                "输出目录 (project)", "train_project_custom", mode="directory",
-            )
 
     # ── 数据配置（右侧） ──
     with col_data:
         st.markdown("#### 📂 数据配置")
 
-        yaml_source = st.radio(
-            "data.yaml 来源",
-            ["默认路径", "自定义路径"],
-            key="train_yaml_source", horizontal=True,
+        data_yaml = _path_browser(
+            "data.yaml 路径",
+            "train_data_yaml",
+            mode="file",
+            file_extensions=(".yaml", ".yml"),
+            start_dir=str(_DATA_TRAIN_DIR),
+            default_value=_DEFAULT_DATA_YAML,
         )
-
-        if yaml_source == "默认路径":
-            default_path = auto_yaml if auto_yaml else _DEFAULT_DATA_YAML
-            data_yaml = st.text_input(
-                "data.yaml 路径", value=default_path, key="train_data_yaml_default",
-                help="来自 train.py 的默认路径，可直接修改",
-            )
-        else:
-            data_yaml = _path_browser(
-                "data.yaml 路径", "train_data_yaml", mode="file",
-                file_extensions=(".yaml", ".yml"),
-                start_dir=st.session_state.get("last_export_dir", CONFIG.default_export_dir),
-            )
 
         if data_yaml and Path(data_yaml).exists():
             st.caption(f"✅ `{Path(data_yaml).name}`")
@@ -919,9 +900,12 @@ def _render_predict(ds):
 
     source = ""
     if source_type == "默认文件夹":
-        source = st.text_input(
-            "输入源路径", value=_DEFAULT_SOURCE, key="pred_source_default",
-            help=f"默认: `{_DEFAULT_SOURCE}`",
+        source = _path_browser(
+            "输入源路径",
+            "pred_source_default",
+            mode="directory",
+            start_dir=_DEFAULT_SOURCE,
+            default_value=_DEFAULT_SOURCE,
         )
         if source and Path(source).is_dir():
             imgs = [f for f in Path(source).iterdir() if f.suffix.lower() in _IMAGE_EXTS]
@@ -982,9 +966,11 @@ def _render_predict(ds):
             pred_save_conf = st.checkbox("txt 中包含置信度", value=False, key="pred_save_conf")
             pred_save_crop = st.checkbox("保存裁剪目标", value=False, key="pred_save_crop")
         with col_o2:
-            pred_project = st.text_input(
-                "输出目录 (project)", value="", key="pred_project",
-                placeholder="留空则自动 runs/{task}",
+            pred_project = _path_browser(
+                "输出目录 (project)",
+                "pred_project",
+                mode="directory",
+                start_dir="/home/cotek/ws_cotek/ultralytics/runs",
             )
             pred_name = st.text_input(
                 "子目录名 (name)", value="predict", key="pred_run_name",

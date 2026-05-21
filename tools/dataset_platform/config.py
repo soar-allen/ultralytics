@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path.home() / ".dataset_platform"
 _CONFIG_FILE = _CONFIG_DIR / "config.yaml"
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -30,7 +31,7 @@ class CVATConfig:
 class PlatformConfig:
     cvat: CVATConfig = field(default_factory=CVATConfig)
     fiftyone_port: int = 5151
-    default_export_dir: str = str(Path.home() / "dataset_exports")
+    default_export_dir: str = str(_PROJECT_ROOT / "data_train")
     image_extensions: tuple = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
     max_samples_per_page: int = 50
 

@@ -1,6 +1,7 @@
 """数据导出页面：数据集导出、模型导出。"""
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import streamlit as st
@@ -8,7 +9,6 @@ import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import exporter
 from tools.dataset_platform import trainer
-from tools.dataset_platform.config import CONFIG
 from tools.dataset_platform.ui.components import (
     _cached_label_classes,
     _cached_tags,
@@ -18,6 +18,8 @@ from tools.dataset_platform.ui.components import (
     _path_browser,
     _primary_action_section,
 )
+
+_DATA_TRAIN_DIR = Path(__file__).resolve().parents[3] / "data_train"
 
 
 def _render_export():
@@ -50,6 +52,10 @@ def _render_export():
 
 def _render_dataset_export(ds):
     st.subheader("数据集导出")
+    _DATA_TRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    default_output_dir = str(_DATA_TRAIN_DIR)
+    if st.session_state.get("export_dir_input") in (None, "", str(Path.home() / "dataset_exports")):
+        st.session_state["export_dir_input"] = default_output_dir
 
     format_choice = st.selectbox(
         "导出格式",
@@ -77,7 +83,7 @@ def _render_dataset_export(ds):
         "输出目录",
         "export_dir",
         mode="dir",
-        start_dir=st.session_state.get("last_export_dir", CONFIG.default_export_dir),
+        start_dir=default_output_dir,
     )
 
     # ── Tag 筛选（所有格式通用） ──
@@ -169,7 +175,7 @@ def _render_dataset_export(ds):
             class_order_yaml = _path_browser(
                 "上一版 data.yaml", "export_class_order_yaml", mode="file",
                 file_extensions=(".yaml", ".yml"),
-                start_dir=CONFIG.default_export_dir,
+                start_dir=default_output_dir,
             )
             if class_order_yaml:
                 locked_class_names = exporter.load_class_names_from_yaml(class_order_yaml)
@@ -268,6 +274,7 @@ def _render_dataset_export(ds):
 
         with st.spinner("导出中..."):
             try:
+                _prepare_dataset_export_dir(output_dir)
                 if is_images_only:
                     result = exporter.export_images_only(export_view, output_dir)
                     st.success("✅ 导出完成")
@@ -362,3 +369,20 @@ def _render_dataset_export(ds):
                 ds.save()
             except Exception as e:
                 st.error(f"导出失败: {e}")
+
+
+def _prepare_dataset_export_dir(output_dir: str | Path) -> None:
+    """Clear data_train before dataset export so different export formats replace old files."""
+    target = Path(output_dir).expanduser().resolve()
+    data_train = _DATA_TRAIN_DIR.resolve()
+    if target != data_train:
+        return
+
+    target.mkdir(parents=True, exist_ok=True)
+    for child in target.iterdir():
+        if child.name == ".gitkeep":
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()

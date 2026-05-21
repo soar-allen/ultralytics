@@ -425,6 +425,7 @@ def _path_browser(
     mode: str = "dir",
     start_dir: str = "",
     file_extensions: tuple | None = None,
+    default_value: str | None = None,
 ) -> str:
     """
     路径浏览器组件。
@@ -439,6 +440,7 @@ def _path_browser(
         mode: "dir" 选择目录, "file" 选择文件
         start_dir: 浏览的起始目录
         file_extensions: 文件模式下的扩展名过滤 (如 (".pt", ".pth"))
+        default_value: 输入框的默认路径
 
     Returns:
         选中的路径字符串
@@ -452,17 +454,26 @@ def _path_browser(
 
     if pending_key in st.session_state:
         st.session_state[input_key] = st.session_state.pop(pending_key)
+    elif input_key not in st.session_state and default_value:
+        st.session_state[input_key] = default_value
 
     current_val = st.session_state.get(input_key, "")
 
-    # --- 手动输入 + 浏览按钮 ---
+    # --- 手动输入 + 文件夹图标按钮 ---
     col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        path_val = st.text_input(label, key=input_key)
     with col_btn:
         st.write("")
-        browse_clicked = st.button("📂 浏览", key=f"{key}_browse")
+        browse_clicked = st.button(
+            "📂",
+            key=f"{key}_browse",
+            help="选择文件夹" if mode == "dir" else "选择文件",
+            use_container_width=True,
+        )
 
     if browse_clicked:
-        initial = current_val or start_dir or str(Path.home())
+        initial = path_val or current_val or start_dir or str(Path.home())
         if mode == "dir" and Path(initial).is_file():
             initial = str(Path(initial).parent)
 
@@ -476,9 +487,6 @@ def _path_browser(
         else:
             # 原生对话框不可用或用户取消 → 展开 Web 浏览器
             st.session_state[f"{key}_show_fallback"] = True
-
-    with col_input:
-        path_val = st.text_input(label, key=input_key)
 
     # --- Web 备用浏览器 ---
     if st.session_state.get(f"{key}_show_fallback", False):
