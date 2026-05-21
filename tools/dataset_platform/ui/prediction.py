@@ -156,18 +156,6 @@ def _render_auto_predict_page():
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     info = _get_info(ds)
-    col_overview, col_unlabeled = st.columns(2)
-    with col_overview:
-        st.metric("📷 数据集样本数", info["num_samples"])
-    with col_unlabeled:
-        stat_key = f"pred_unlabeled_count_{ds.name}"
-        if st.button("刷新无标注统计", key="btn_pred_refresh_unlabeled", use_container_width=True):
-            with st.spinner("正在统计无标注样本..."):
-                st.session_state[stat_key] = len(processor.find_unlabeled_samples(ds))
-        st.metric("🔲 无标注样本数", st.session_state.get(stat_key, "未计算"))
-
-    st.markdown("---")
-
     mode = st.radio(
         "**预标注模式**",
         ["🦴 YOLO Pose → 四角多边形", "🎯 SAM3 辅助标注", "🏷️ SAM3 标注标签"],
