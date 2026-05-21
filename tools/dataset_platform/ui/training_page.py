@@ -14,6 +14,80 @@ from tools.dataset_platform.ui.components import _get_ds, _path_browser
 _BASE_MODEL_DIR = Path.home() / ".dataset_platform" / "base_model"
 _DATA_TRAIN_DIR = Path(__file__).resolve().parents[3] / "data_train"
 _DEFAULT_DATA_YAML = str(_DATA_TRAIN_DIR / "data.yaml")
+_TRAIN_CONFIG_SETTINGS_KEY = "train_config_settings"
+_TRAIN_CONFIG_ACTIVE_DATASET_KEY = "_train_config_active_dataset"
+
+_TRAIN_CONFIG_DEFAULTS = {
+    "train_incremental_enable": False,
+    "train_incremental_new_classes": [],
+    "train_incremental_new_classes_text": "",
+    "train_incremental_old_replay_per_class": 200,
+    "train_incremental_seed": 42,
+    "train_incremental_auto_balance": True,
+    "train_epochs": 150,
+    "train_imgsz": 640,
+    "train_batch": 16,
+    "train_device": "0",
+    "train_hsv_h": 0.015,
+    "train_hsv_s": 0.7,
+    "train_hsv_v": 0.5,
+    "train_degrees": 3.0,
+    "train_translate": 0.0,
+    "train_scale": 0.0,
+    "train_shear": 2.0,
+    "train_perspective": 0.0003,
+    "train_fliplr": 0.5,
+    "train_flipud": 0.0,
+    "train_mosaic": 1.0,
+    "train_close_mosaic": 15,
+    "train_mixup": 0.0,
+    "train_cutmix": 0.0,
+    "train_multi_scale": 0.0,
+    "train_balance_enable": False,
+    "train_balance_names": "tian",
+    "train_balance_reference_names": "chuan",
+    "train_balance_ratio": 0.5,
+    "train_balance_max_repeat": 3,
+    "train_balance_pure_minority_only": True,
+    "train_cls": 0.8,
+    "train_box": 7.5,
+    "train_dfl": 1.5,
+    "train_lr0": 0.01,
+    "train_lrf": 0.01,
+    "train_wd": 0.0005,
+    "train_optimizer": "auto",
+    "train_cos_lr": False,
+    "train_patience": 100,
+    "train_momentum": 0.937,
+    "train_warmup_epochs": 3.0,
+    "train_warmup_momentum": 0.8,
+}
+
+
+def _apply_train_config_settings(ds) -> None:
+    """Apply saved training config settings once when entering a dataset."""
+    if st.session_state.get(_TRAIN_CONFIG_ACTIVE_DATASET_KEY) == ds.name:
+        return
+
+    saved = ds.info.get(_TRAIN_CONFIG_SETTINGS_KEY, {})
+    if not isinstance(saved, dict):
+        saved = {}
+
+    for key, default in _TRAIN_CONFIG_DEFAULTS.items():
+        st.session_state[key] = saved.get(key, default)
+    if st.session_state.get("train_optimizer") not in ("auto", "SGD", "Adam", "AdamW"):
+        st.session_state["train_optimizer"] = _TRAIN_CONFIG_DEFAULTS["train_optimizer"]
+    st.session_state[_TRAIN_CONFIG_ACTIVE_DATASET_KEY] = ds.name
+
+
+def _save_train_config_settings(ds) -> None:
+    """Persist current training config widget values on the dataset."""
+    settings = {
+        key: st.session_state.get(key, default)
+        for key, default in _TRAIN_CONFIG_DEFAULTS.items()
+    }
+    ds.info[_TRAIN_CONFIG_SETTINGS_KEY] = settings
+    ds.save()
 
 
 def _list_base_models() -> list[str]:
@@ -58,6 +132,7 @@ def _render_training_page():
 
 def _render_train_config(ds):
     st.subheader("训练配置")
+    _apply_train_config_settings(ds)
 
     status = trainer.get_training_status()
     if status["running"]:
@@ -155,6 +230,11 @@ def _render_train_config(ds):
             key="train_incremental_enable",
         )
         if class_names:
+            if "train_incremental_new_classes" in st.session_state:
+                st.session_state["train_incremental_new_classes"] = [
+                    name for name in st.session_state["train_incremental_new_classes"]
+                    if name in class_names
+                ]
             incremental_new_classes = st.multiselect(
                 "新增类别",
                 class_names,
@@ -403,6 +483,7 @@ def _render_train_config(ds):
         )
 
         if result["started"]:
+            _save_train_config_settings(ds)
             st.success(result["message"])
             st.info("训练在后台运行中，可定期刷新此页面查看进度。训练完成后结果会自动记录到「训练历史」。")
         else:
