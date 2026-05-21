@@ -32,11 +32,21 @@ logger = logging.getLogger(__name__)
 def find_unlabeled_samples(
     ds: fo.Dataset,
     label_fields: Optional[list[str]] = None,
+    exclude_tags: Optional[list[str]] = None,
 ) -> fo.DatasetView:
     """
     查找所有标签字段均为空的样本。
     如果 label_fields 未指定，自动扫描数据集中的所有标签字段。
+    默认排除带有 background 标签的背景负样本，避免无标注统计和清理误包含背景图。
     """
+    if exclude_tags is None:
+        exclude_tags = ["background"]
+
+    def _exclude_tagged(view: fo.DatasetView | fo.Dataset) -> fo.DatasetView:
+        for tag in exclude_tags or []:
+            view = view.match_tags(tag, bool=False)
+        return view
+
     if label_fields is None:
         import fiftyone.core.fields as fof
         label_fields = []
@@ -50,7 +60,7 @@ def find_unlabeled_samples(
                     label_fields.append(name)
 
     if not label_fields:
-        return ds.view()
+        return _exclude_tagged(ds.view())
 
     from fiftyone import ViewField as F
     expr = None
@@ -77,17 +87,18 @@ def find_unlabeled_samples(
         expr = cond if expr is None else (expr & cond)
 
     if expr is None:
-        return ds.view()
-    return ds.match(expr)
+        return _exclude_tagged(ds.view())
+    return _exclude_tagged(ds.match(expr))
 
 
 def delete_unlabeled_samples(
     ds: fo.Dataset,
     label_fields: Optional[list[str]] = None,
     physical: bool = False,
+    exclude_tags: Optional[list[str]] = None,
 ) -> int:
     """删除无标注样本。physical=True 时同时删除磁盘文件。"""
-    view = find_unlabeled_samples(ds, label_fields)
+    view = find_unlabeled_samples(ds, label_fields, exclude_tags=exclude_tags)
     count = len(view)
     if count == 0:
         return 0
