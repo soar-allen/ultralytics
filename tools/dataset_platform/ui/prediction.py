@@ -204,7 +204,7 @@ def _render_pose_mode(ds, info: dict, unlabeled):
         pred_field = _field_selector(
             ds,
             "pose",
-            default="pridict_polylines",
+            default="predict_polylines",
             field_type_filter="polylines",
             select_existing_default=True,
         )
@@ -292,7 +292,7 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         pred_field = _field_selector(
             ds,
             "sam3",
-            default="pridict",
+            default="predict",
             field_type_filter="detections",
             select_existing_default=True,
         )

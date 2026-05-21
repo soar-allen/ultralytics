@@ -1,4 +1,4 @@
-"""质量与难例：标注质量检查、难例挖掘、FiftyOne Brain。"""
+"""数据集分析：标注质量检查、难例挖掘、FiftyOne Brain。"""
 from __future__ import annotations
 
 import streamlit as st
@@ -9,14 +9,14 @@ from tools.dataset_platform.ui.quality_page import _render_quality_checks
 
 
 def _render_quality_and_hard_samples():
-    st.header("🔬 质量与难例")
+    st.header("🔬 数据集分析")
     ds = _get_ds()
     if ds is None:
         st.info("请先选择数据集")
         return
 
     section = st.radio(
-        "质量与难例模块",
+        "数据集分析模块",
         ["🔬 标注质量", "🎯 难例挖掘", "🧬 FiftyOne Brain"],
         key="quality_hard_section",
         horizontal=True,

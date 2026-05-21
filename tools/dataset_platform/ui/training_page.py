@@ -580,7 +580,7 @@ def _render_progress_and_history(ds):
         st.info(f"当前最优权重: `{last_best}`")
         if st.button("📋 设为预标注模型", key="btn_set_predict_model"):
             st.session_state["pred_model_input"] = last_best
-            st.success(f"已将 `{last_best}` 设为预标注模型，可前往「自动预标注」页面使用")
+            st.success(f"已将 `{last_best}` 设为预标注模型，可前往「数据集标注 → 自动预标注」页面使用")
 
     if history:
         st.markdown("---")
@@ -1115,7 +1115,7 @@ def _render_train_feedback(ds):
                 else:
                     mc2.metric("mAP", "N/A")
                 st.info(
-                    "💡 回灌完成后可前往「质量与难例 → 难例挖掘」查找模型表现差的样本，"
+                    "💡 回灌完成后可前往「数据集分析 → 难例挖掘」查找模型表现差的样本，"
                     "然后推送到 CVAT 进行重标注。"
                 )
             except Exception as e:

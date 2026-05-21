@@ -45,6 +45,8 @@ def _render_navigation_menu():
     active_key = resolve_page_key(st.session_state.get("_active_page"))
     active_label = page_by_key(active_key).label
     cur_idx = PAGE_LABELS.index(active_label) if active_label in PAGE_LABELS else 0
+    if st.session_state.get("_workflow_nav") not in (None, *PAGE_LABELS):
+        del st.session_state["_workflow_nav"]
 
     selected_label = st.sidebar.radio(
         "页面导航", PAGE_LABELS, index=cur_idx, key="_workflow_nav",

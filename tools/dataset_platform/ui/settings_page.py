@@ -1,4 +1,4 @@
-"""设置与管理：数据集操作、CVAT 配置、备份恢复。"""
+"""工作区设置：数据集操作、CVAT 配置、备份恢复。"""
 from __future__ import annotations
 
 import streamlit as st
@@ -9,10 +9,10 @@ from tools.dataset_platform.ui.sidebar import _render_cvat_settings, _render_dat
 
 
 def _render_settings_page():
-    st.header("⚙️ 设置与管理")
+    st.header("⚙️ 工作区设置")
 
     section = st.radio(
-        "设置管理模块",
+        "工作区设置模块",
         ["📦 数据集操作", "🔗 CVAT 配置", "💾 备份恢复"],
         key="settings_section",
         horizontal=True,

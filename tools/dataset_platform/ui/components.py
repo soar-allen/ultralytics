@@ -177,7 +177,7 @@ def _render_workspace_header():
 
     st.title("CV 数据集管理平台")
     if ds is None:
-        st.info("请先选择数据集，或在「设置与管理」中新建数据集")
+        st.info("请先选择数据集，或在「工作区设置」中新建数据集")
         return
     st.markdown("---")
 

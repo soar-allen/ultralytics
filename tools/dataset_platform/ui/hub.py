@@ -1,4 +1,4 @@
-"""数据总览：数据集统计仪表盘、标签筛选、标签管理、健康检查。"""
+"""数据总览：数据集统计仪表盘、标签筛选。"""
 from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
@@ -10,14 +10,18 @@ def _render_data_hub():
     st.header("📊 数据总览")
     ds = _get_ds()
     if ds is None:
-        st.info("请先选择数据集，或在「设置与管理」中新建数据集")
+        st.info("请先选择数据集，或在「工作区设置」中新建数据集")
         return
 
     info = _get_info(ds)
 
+    hub_sections = ["📊 概览统计", "🔎 筛选查看"]
+    if st.session_state.get("hub_section") not in (None, *hub_sections):
+        del st.session_state["hub_section"]
+
     section = st.radio(
         "数据总览模块",
-        ["📊 概览统计", "🔎 筛选查看", "🏷️ 标签管理", "🩺 健康检查"],
+        hub_sections,
         key="hub_section",
         horizontal=True,
         label_visibility="collapsed",
@@ -25,12 +29,8 @@ def _render_data_hub():
 
     if section.startswith("📊"):
         _render_hub_statistics(ds, info)
-    elif section.startswith("🔎"):
-        _render_hub_tag_filter(ds, info)
-    elif section.startswith("🏷️"):
-        _render_label_management(ds)
     else:
-        _render_hub_health(ds, info)
+        _render_hub_tag_filter(ds, info)
 
 
 def _render_hub_statistics(ds, info: dict):
@@ -208,7 +208,7 @@ def _render_hub_tag_filter(ds, info: dict):
                 cvat_url = CONFIG.cvat.url.rstrip("/")
                 st.link_button("🔗 打开 CVAT 面板", f"{cvat_url}/tasks")
             else:
-                st.caption("当前数据集暂无 CVAT 标注运行，需先在「CVAT 标注同步」中推送数据。")
+                st.caption("当前数据集暂无 CVAT 标注运行，需先在「数据集标注 → CVAT 标注同步」中推送数据。")
 
         # 筛选结果的标注统计
         with st.expander("📊 筛选结果统计", expanded=False):
