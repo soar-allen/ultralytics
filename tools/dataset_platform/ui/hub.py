@@ -3,7 +3,12 @@ from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform.config import CONFIG
-from tools.dataset_platform.ui.components import _cached_label_stats, _get_ds, _get_info
+from tools.dataset_platform.ui.components import (
+    _cached_label_stats,
+    _get_ds,
+    _get_info,
+    _show_view_in_fiftyone_button,
+)
 
 
 def _render_data_hub():
@@ -289,7 +294,21 @@ def _render_label_management(ds):
             st.info("当前数据集没有任何标签可移除")
             new_tags = []
 
-    if st.button(f"{'🏷️ 添加' if tag_action == '添加标签' else '🗑️ 移除'}标签", key="btn_tag_mgmt"):
+    col_run, col_preview = st.columns([2, 1])
+    with col_run:
+        tag_mgmt_clicked = st.button(
+            f"{'🏷️ 添加' if tag_action == '添加标签' else '🗑️ 移除'}标签",
+            key="btn_tag_mgmt",
+            use_container_width=True,
+        )
+    with col_preview:
+        _show_view_in_fiftyone_button(
+            target,
+            key="btn_tag_mgmt_preview",
+            label="👁️ 展示处理样本",
+            disabled=len(target) == 0,
+        )
+    if tag_mgmt_clicked:
         if not new_tags:
             st.error("请指定要操作的标签")
         else:

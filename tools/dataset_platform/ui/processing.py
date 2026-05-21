@@ -3,7 +3,12 @@ from __future__ import annotations
 import streamlit as st
 from tools.dataset_platform import data_manager as dm
 from tools.dataset_platform import processor
-from tools.dataset_platform.ui.components import _get_ds, _get_info, _invalidate_ui_stats_cache
+from tools.dataset_platform.ui.components import (
+    _get_ds,
+    _get_info,
+    _invalidate_ui_stats_cache,
+    _show_view_in_fiftyone_button,
+)
 
 
 # ===================================================================
@@ -63,7 +68,14 @@ def _render_bad_polylines(ds):
             "取凸包 → 选面积最大的 4 点子集 → 排序为 tl→tr→br→bl。"
             "已经是 4 点的多边形仅重新排序。无法构成有效四边形的保留原样。"
         )
-        if st.button("🔄 执行转换", key="btn_convert_quads"):
+        col_run, col_preview = st.columns([2, 1])
+        with col_run:
+            convert_clicked = st.button("🔄 执行转换", key="btn_convert_quads", use_container_width=True)
+        with col_preview:
+            _show_view_in_fiftyone_button(
+                bp_view, key="btn_convert_quads_preview", label="👁️ 展示处理样本",
+            )
+        if convert_clicked:
             with st.spinner(f"转换 {len(bp_view)} 个样本中..."):
                 stats = processor.convert_polylines_to_quads(bp_view, label_field=bp_field)
             st.success("转换完成")
@@ -137,10 +149,24 @@ def _render_bad_polylines(ds):
                 confirm_bp_del = st.checkbox(
                     f"⚠️ 确认删除 {bad_count} 个异常样本", key="confirm_del_bad_poly",
                 )
-                if st.button("🗑️ 删除已标记的异常样本", key="btn_del_bad_poly",
-                             type="primary", disabled=not confirm_bp_del):
+                bad_view = ds.match_tags([bad_tag])
+                col_run, col_preview = st.columns([2, 1])
+                with col_run:
+                    del_bad_clicked = st.button(
+                        "🗑️ 删除已标记的异常样本",
+                        key="btn_del_bad_poly",
+                        type="primary",
+                        disabled=not confirm_bp_del,
+                        use_container_width=True,
+                    )
+                with col_preview:
+                    _show_view_in_fiftyone_button(
+                        bad_view,
+                        key="btn_del_bad_poly_preview",
+                        label="👁️ 展示匹配样本",
+                    )
+                if del_bad_clicked:
                     with st.spinner("删除中..."):
-                        bad_view = ds.match_tags([bad_tag])
                         ids = bad_view.values("id")
                         if bp_del_physical:
                             dm.delete_samples_physically(ds, ids)
@@ -156,7 +182,14 @@ def _render_bad_polylines(ds):
                     st.session_state["_toast_msg"] = f"已清除 {cleared} 个样本的 {bad_tag} 标记"
                     st.rerun()
 
-        if st.button("🔍 扫描不合格托盘多边形", key="btn_scan_bad_poly"):
+        col_run, col_preview = st.columns([2, 1])
+        with col_run:
+            scan_bad_clicked = st.button("🔍 扫描不合格托盘多边形", key="btn_scan_bad_poly", use_container_width=True)
+        with col_preview:
+            _show_view_in_fiftyone_button(
+                bp_view, key="btn_scan_bad_poly_preview", label="👁️ 展示处理样本",
+            )
+        if scan_bad_clicked:
             with st.spinner(f"扫描 {len(bp_view)} 个样本中..."):
                 result = processor.find_bad_pallet_polylines(
                     bp_view,
@@ -261,8 +294,22 @@ def _render_cleaning(ds):
             confirm_del_by_tag = st.checkbox(
                 f"⚠️ 确认删除匹配的 {tag_match_count} 个样本", key="confirm_del_by_tag",
             ) if del_tags and tag_match_count > 0 else False
-            if st.button("🗑️ 删除匹配样本", key="btn_del_by_tag",
-                         disabled=not confirm_del_by_tag):
+            col_run, col_preview = st.columns([2, 1])
+            with col_run:
+                del_by_tag_clicked = st.button(
+                    "🗑️ 删除匹配样本",
+                    key="btn_del_by_tag",
+                    disabled=not confirm_del_by_tag,
+                    use_container_width=True,
+                )
+            with col_preview:
+                _show_view_in_fiftyone_button(
+                    tag_view if del_tags else ds.view(),
+                    key="btn_del_by_tag_preview",
+                    label="👁️ 展示匹配样本",
+                    disabled=not del_tags,
+                )
+            if del_by_tag_clicked:
                 if del_tags:
                     tag_view = ds.match_tags(del_tags)
                     count = len(tag_view)
@@ -342,10 +389,24 @@ def _render_cleaning(ds):
                 confirm_del_dup = st.checkbox(
                     f"⚠️ 确认删除 {dup_count} 个重复样本", key="confirm_del_dup_tagged",
                 )
-                if st.button("🗑️ 删除已标记的重复样本", key="btn_del_dup_tagged",
-                             type="primary", disabled=not confirm_del_dup):
+                dup_view = ds.match_tags(["duplicate"])
+                col_run, col_preview = st.columns([2, 1])
+                with col_run:
+                    del_dup_clicked = st.button(
+                        "🗑️ 删除已标记的重复样本",
+                        key="btn_del_dup_tagged",
+                        type="primary",
+                        disabled=not confirm_del_dup,
+                        use_container_width=True,
+                    )
+                with col_preview:
+                    _show_view_in_fiftyone_button(
+                        dup_view,
+                        key="btn_del_dup_tagged_preview",
+                        label="👁️ 展示匹配样本",
+                    )
+                if del_dup_clicked:
                     with st.spinner("删除中..."):
-                        dup_view = ds.match_tags(["duplicate"])
                         ids = dup_view.values("id")
                         if dup_del_physical:
                             dm.delete_samples_physically(ds, ids)
@@ -369,8 +430,16 @@ def _render_cleaning(ds):
                         del st.session_state["dup_groups"]
                     st.rerun()
 
-        if st.button("🔍 扫描重复图像", key="btn_scan_dup"):
+        col_run, col_preview = st.columns([2, 1])
+        with col_run:
+            scan_dup_clicked = st.button("🔍 扫描重复图像", key="btn_scan_dup", use_container_width=True)
+        with col_preview:
+            _show_view_in_fiftyone_button(
+                dedup_view, key="btn_scan_dup_preview", label="👁️ 展示扫描样本",
+            )
+        if scan_dup_clicked:
             all_groups = []
+            st.session_state["dup_scan_ids"] = dedup_view.values("id")
             with st.spinner(f"扫描 {len(dedup_view)} 个样本中..."):
                 if dedup_mode in ("精确哈希", "两者兼有"):
                     exact = processor.find_exact_duplicates(dedup_view)
@@ -390,7 +459,18 @@ def _render_cleaning(ds):
             groups = st.session_state["dup_groups"]
             tag_only = st.checkbox("仅打标签不删除", value=True, key="dup_tag_only")
             physical = st.checkbox("同时删除磁盘文件", key="dup_physical")
-            if st.button("执行去重", key="btn_exec_dedup"):
+            preview_ids = st.session_state.get("dup_scan_ids", [])
+            preview_view = ds.select(preview_ids) if preview_ids else dedup_view
+            col_run, col_preview = st.columns([2, 1])
+            with col_run:
+                exec_dedup_clicked = st.button("执行去重", key="btn_exec_dedup", use_container_width=True)
+            with col_preview:
+                _show_view_in_fiftyone_button(
+                    preview_view,
+                    key="btn_exec_dedup_preview",
+                    label="👁️ 展示扫描样本",
+                )
+            if exec_dedup_clicked:
                 if tag_only:
                     count = processor.tag_duplicates(ds, groups)
                     st.success(f"✅ 标记 {count} 个重复样本")
@@ -398,6 +478,7 @@ def _render_cleaning(ds):
                     count = processor.delete_duplicates(ds, groups, physical=physical)
                     st.success(f"✅ 删除 {count} 个重复样本")
                 del st.session_state["dup_groups"]
+                st.session_state.pop("dup_scan_ids", None)
                 st.rerun()
 
 
@@ -456,7 +537,16 @@ def _render_field_management(ds):
 
         can_run = bool(field_name) and name_ok and len(view) > 0
 
-        if st.button("➕ 添加字段", key="btn_add_field", disabled=not can_run):
+        col_run, col_preview = st.columns([2, 1])
+        with col_run:
+            add_field_clicked = st.button(
+                "➕ 添加字段", key="btn_add_field", disabled=not can_run, use_container_width=True,
+            )
+        with col_preview:
+            _show_view_in_fiftyone_button(
+                view, key="btn_add_field_preview", label="👁️ 展示处理样本", disabled=len(view) == 0,
+            )
+        if add_field_clicked:
             added = 0
             skipped = 0
             progress = st.progress(0, text="添加中...")
@@ -530,10 +620,22 @@ def _render_field_management(ds):
                 f"⚠️ 确认清空 {len(del_view)} 个样本的 `{field_to_del}` 字段",
                 key="confirm_clear_field",
             )
-            if st.button(
-                "🧹 清空字段值", key="btn_clear_field",
-                disabled=not confirm_clear,
-            ):
+            col_run, col_preview = st.columns([2, 1])
+            with col_run:
+                clear_field_clicked = st.button(
+                    "🧹 清空字段值",
+                    key="btn_clear_field",
+                    disabled=not confirm_clear,
+                    use_container_width=True,
+                )
+            with col_preview:
+                _show_view_in_fiftyone_button(
+                    del_view,
+                    key="btn_clear_field_preview",
+                    label="👁️ 展示处理样本",
+                    disabled=len(del_view) == 0,
+                )
+            if clear_field_clicked:
                 cleared = 0
                 progress = st.progress(0, text="清空中...")
                 total = len(del_view)

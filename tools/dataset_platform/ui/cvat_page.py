@@ -217,12 +217,27 @@ def _render_cvat_push(ds):
         "图像质量": image_quality,
         "启用废弃标记": "是" if include_review else "否",
     }
+
+    push_samples_preview = None
+    if can_push:
+        ref_field_preview = list(label_schema.keys())[0] if label_schema else single_label_field
+        push_samples_preview = ds
+        if push_mode == "仅无标注样本":
+            push_samples_preview = dm.get_unlabeled_view(ds, ref_field_preview)
+        elif push_mode == "仅有标注样本":
+            push_samples_preview = dm.get_labeled_view(ds, ref_field_preview)
+        if push_filter_tags:
+            push_samples_preview = push_samples_preview.match_tags(push_filter_tags)
+
     if _primary_action_section(
         "📤 推送到 CVAT",
         "btn_push",
         push_summary,
         disabled=not can_push,
         disabled_reason="请选择已有标签字段，或输入一个新字段名",
+        preview_view=push_samples_preview,
+        preview_key="btn_push_preview",
+        preview_label="👁️ 展示推送样本",
     ):
         if not anno_key:
             st.error("请输入标注键 (anno_key)")
@@ -242,14 +257,7 @@ def _render_cvat_push(ds):
                 st.error(f"标注键 `{anno_key}` 已存在！")
                 return
 
-        ref_field = list(label_schema.keys())[0] if label_schema else single_label_field
-        samples = ds
-        if push_mode == "仅无标注样本":
-            samples = dm.get_unlabeled_view(ds, ref_field)
-        elif push_mode == "仅有标注样本":
-            samples = dm.get_labeled_view(ds, ref_field)
-        if push_filter_tags:
-            samples = samples.match_tags(push_filter_tags)
+        samples = push_samples_preview or ds
         if len(samples) == 0:
             st.error("所选范围内没有样本可推送")
             return

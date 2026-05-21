@@ -237,6 +237,9 @@ def _render_export():
         summary,
         disabled=bool(disabled_reason),
         disabled_reason=disabled_reason,
+        preview_view=export_view,
+        preview_key="btn_export_preview",
+        preview_label="👁️ 展示导出样本",
     ):
 
         with st.spinner("导出中..."):

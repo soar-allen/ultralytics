@@ -215,13 +215,58 @@ def _primary_action_section(
     summary: dict[str, object] | None = None,
     disabled: bool = False,
     disabled_reason: str | None = None,
+    preview_view=None,
+    preview_key: str | None = None,
+    preview_label: str = "👁️ 展示筛选结果",
 ) -> bool:
     """Render a consistent pre-action summary and primary button."""
     if summary:
         _action_summary("执行前确认", summary, expanded=True)
     if disabled and disabled_reason:
         st.warning(disabled_reason)
+    if preview_view is not None:
+        col_run, col_preview = st.columns([2, 1])
+        with col_run:
+            clicked = st.button(button_label, key=key, type="primary", disabled=disabled, use_container_width=True)
+        with col_preview:
+            _show_view_in_fiftyone_button(
+                preview_view,
+                key=preview_key or f"{key}_preview_fo",
+                label=preview_label,
+            )
+        return clicked
     return st.button(button_label, key=key, type="primary", disabled=disabled, use_container_width=True)
+
+
+def _show_view_in_fiftyone_button(
+    view,
+    *,
+    key: str,
+    label: str = "👁️ 展示筛选结果",
+    disabled: bool = False,
+    use_container_width: bool = True,
+) -> bool:
+    """Render a button that sends the provided dataset/view to the FiftyOne App."""
+    clicked = st.button(label, key=key, disabled=disabled, use_container_width=use_container_width)
+    if not clicked:
+        return False
+
+    try:
+        count = len(view)
+        if count == 0:
+            st.warning("当前筛选结果为空，无法在 FiftyOne 中展示")
+            return True
+
+        dataset = getattr(view, "_dataset", view)
+        display_view = view.view() if dataset is view and hasattr(view, "view") else view
+        port = st.session_state.get("fo_port", CONFIG.fiftyone_port)
+        dm.ensure_app(dataset, port=port)
+        dm.set_session_view(display_view)
+        st.success(f"已在 FiftyOne 中展示 {count} 个样本")
+        st.link_button("打开 FiftyOne", f"http://localhost:{port}")
+    except Exception as e:
+        st.error(f"展示筛选结果失败: {e}")
+    return True
 
 
 def _render_scope_selector(

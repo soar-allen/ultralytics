@@ -23,6 +23,7 @@ from tools.dataset_platform.ui.components import (
     _path_browser,
     _primary_action_section,
     _render_scope_selector as _common_scope_selector,
+    _show_view_in_fiftyone_button,
 )
 
 _MODEL_DIR = Path.home() / ".dataset_platform" / "model"
@@ -253,6 +254,9 @@ def _render_pose_mode(ds, info: dict, unlabeled):
         },
         disabled=not can_run,
         disabled_reason="请选择有效的模型权重文件",
+        preview_view=target or ds,
+        preview_key="btn_pose_predict_preview",
+        preview_label="👁️ 展示处理样本",
     ):
 
         target_count = len(target) if target is not None else len(ds)
@@ -462,6 +466,9 @@ def _render_sam3_mode(ds, info: dict, unlabeled):
         },
         disabled=bool(disabled_reason),
         disabled_reason=disabled_reason,
+        preview_view=target or ds,
+        preview_key="btn_sam3_predict_preview",
+        preview_label="👁️ 展示处理样本",
     ):
         if p_mode == "text" and not text_prompts:
             st.error("请输入至少一个文本提示")
@@ -616,6 +623,9 @@ def _render_sam3_tag_mode(ds, info: dict, unlabeled):
         },
         disabled=bool(disabled_reason),
         disabled_reason=disabled_reason,
+        preview_view=target or ds,
+        preview_key="btn_sam3_tag_preview",
+        preview_label="👁️ 展示处理样本",
     ):
         target_count = len(target) if target is not None else len(ds)
         with st.spinner(f"使用 SAM3 对 {target_count} 个样本进行目标识别..."):
@@ -747,9 +757,23 @@ def _render_clear_tag_section(ds):
         tagged_count = len(ds.match_tags(tag_to_clear))
         st.caption(f"有 **{tagged_count}** 个样本带有此标签")
 
-        if tagged_count > 0 and st.button(
-            f"清除标签 「{tag_to_clear}」", key="btn_clear_tag",
-        ):
+        tagged_view = ds.match_tags(tag_to_clear)
+        col_run, col_preview = st.columns([2, 1])
+        with col_run:
+            clear_clicked = st.button(
+                f"清除标签 「{tag_to_clear}」",
+                key="btn_clear_tag",
+                disabled=tagged_count <= 0,
+                use_container_width=True,
+            )
+        with col_preview:
+            _show_view_in_fiftyone_button(
+                tagged_view,
+                key="btn_clear_tag_preview",
+                label="👁️ 展示匹配样本",
+                disabled=tagged_count <= 0,
+            )
+        if clear_clicked:
             with st.spinner(f"正在从 {tagged_count} 个样本中清除标签..."):
                 cleared = processor.clear_tag_from_dataset(ds, tag_to_clear)
             _invalidate_ui_stats_cache()
