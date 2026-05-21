@@ -20,6 +20,90 @@ from tools.dataset_platform.ui.components import (
 )
 
 _DATA_TRAIN_DIR = Path(__file__).resolve().parents[3] / "data_train"
+_EXPORT_FORMAT_SETTINGS_KEY = "dataset_export_format_settings"
+_EXPORT_ACTIVE_FORMAT_KEY = "_export_active_format"
+_EXPORT_PENDING_APPLY_KEY = "_export_pending_apply_format"
+
+
+def _get_export_format_settings(ds, format_choice: str) -> dict:
+    """Return saved dataset export settings for one export format."""
+    settings = ds.info.get(_EXPORT_FORMAT_SETTINGS_KEY, {})
+    if not isinstance(settings, dict):
+        return {}
+    value = settings.get(format_choice, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _save_export_format_settings(ds, format_choice: str, settings: dict) -> None:
+    """Persist the latest successful non-image export settings on the dataset."""
+    if format_choice == "📷 纯图片":
+        return
+    all_settings = ds.info.get(_EXPORT_FORMAT_SETTINGS_KEY, {})
+    if not isinstance(all_settings, dict):
+        all_settings = {}
+    all_settings[format_choice] = settings
+    ds.info[_EXPORT_FORMAT_SETTINGS_KEY] = all_settings
+    ds.save()
+
+
+def _apply_export_format_settings(format_choice: str, settings: dict, all_tags: list[str]) -> None:
+    """Reset shared widgets when switching export formats and apply saved defaults."""
+    if st.session_state.get(_EXPORT_ACTIVE_FORMAT_KEY) == format_choice:
+        return
+    st.session_state[_EXPORT_ACTIVE_FORMAT_KEY] = format_choice
+    st.session_state[_EXPORT_PENDING_APPLY_KEY] = format_choice
+
+    if format_choice == "📷 纯图片":
+        st.session_state["export_tags"] = []
+        return
+
+    st.session_state["export_tags"] = _filter_existing(settings.get("tags_filter", []), all_tags)
+    st.session_state["export_include_background_train"] = bool(settings.get("include_background_train", True))
+    split_mode = settings.get("split_mode", "按比例自动划分")
+    if split_mode not in ("按比例自动划分", "指定单个 Split"):
+        split_mode = "按比例自动划分"
+    st.session_state["export_split_mode"] = split_mode
+    st.session_state["split_train_pct"] = int(settings.get("train_pct", 80))
+    st.session_state["split_valid_pct"] = int(settings.get("valid_pct", 10))
+    st.session_state["split_test_pct"] = int(settings.get("test_pct", 10))
+    single_split = settings.get("single_split", "train")
+    st.session_state["export_split"] = single_split if single_split in ("train", "valid", "test") else "train"
+    if settings.get("class_order_yaml"):
+        st.session_state["export_class_order_yaml_input"] = settings["class_order_yaml"]
+    else:
+        st.session_state.pop("export_class_order_yaml_input", None)
+    if settings.get("kp_field"):
+        st.session_state["export_kp_field"] = settings["kp_field"]
+    else:
+        st.session_state.pop("export_kp_field", None)
+    st.session_state["export_mixed_detection_classes"] = ", ".join(settings.get("mixed_detection_classes") or ["pallet"])
+    st.session_state["export_mixed_edge_threshold"] = float(settings.get("edge_threshold", 5.0))
+    st.session_state["export_mixed_bbox_margin"] = float(settings.get("bbox_margin", 0.0))
+    st.session_state["export_edge_threshold"] = float(settings.get("edge_threshold", 5.0))
+    st.session_state["export_bbox_margin"] = float(settings.get("bbox_margin", 0.0))
+    if settings.get("obb_field"):
+        st.session_state["export_obb_field"] = settings["obb_field"]
+    else:
+        st.session_state.pop("export_obb_field", None)
+
+
+def _filter_existing(values, options: list[str]) -> list[str]:
+    """Keep saved multiselect values that still exist in current options."""
+    if not values:
+        return []
+    option_set = set(options)
+    return [value for value in values if value in option_set]
+
+
+def _select_index(options: list[str], value: str | None, default: int = 0) -> int:
+    """Return a safe selectbox index."""
+    if value in options:
+        return options.index(value)
+    return default if options else 0
+
+
+def _is_applying_export_settings(format_choice: str) -> bool:
+    return st.session_state.get(_EXPORT_PENDING_APPLY_KEY) == format_choice
 
 
 def _render_export():
@@ -71,6 +155,9 @@ def _render_dataset_export(ds):
     )
 
     is_images_only = format_choice == "📷 纯图片"
+    all_tags = _cached_tags(ds)
+    saved_settings = _get_export_format_settings(ds, format_choice)
+    _apply_export_format_settings(format_choice, saved_settings, all_tags)
 
     if format_choice == "YOLO Pose (四边形转关键点)":
         st.info("将 4 点多边形 (Polylines) 自动转换为 YOLO Pose 格式")
@@ -87,9 +174,10 @@ def _render_dataset_export(ds):
     )
 
     # ── Tag 筛选（所有格式通用） ──
-    all_tags = _cached_tags(ds)
     selected_tags = []
     if all_tags:
+        if "export_tags" in st.session_state:
+            st.session_state["export_tags"] = _filter_existing(st.session_state["export_tags"], all_tags)
         selected_tags = st.multiselect("按 Tag 筛选样本（留空导出全部）", all_tags, key="export_tags")
 
     if selected_tags:
@@ -136,11 +224,11 @@ def _render_dataset_export(ds):
             st.caption("设置比例，三者之和应为 100%")
             col_t, col_v, col_te = st.columns(3)
             with col_t:
-                train_pct = st.number_input("Train %", 0, 100, 80, key="split_train_pct")
+                train_pct = st.number_input("Train %", 0, 100, int(saved_settings.get("train_pct", 80)), key="split_train_pct")
             with col_v:
-                valid_pct = st.number_input("Valid %", 0, 100, 10, key="split_valid_pct")
+                valid_pct = st.number_input("Valid %", 0, 100, int(saved_settings.get("valid_pct", 10)), key="split_valid_pct")
             with col_te:
-                test_pct = st.number_input("Test %", 0, 100, 10, key="split_test_pct")
+                test_pct = st.number_input("Test %", 0, 100, int(saved_settings.get("test_pct", 10)), key="split_test_pct")
             total_pct = train_pct + valid_pct + test_pct
             if total_pct != 100:
                 st.warning(f"当前总比例为 {total_pct}%，请调整为 100%")
@@ -163,12 +251,32 @@ def _render_dataset_export(ds):
             label_fields,
             label_type="polylines" if format_choice in {"YOLO 混合训练（pose）", "YOLO Pose (四边形转关键点)"} else None,
         )
+        saved_label_field = saved_settings.get("label_field")
+        if saved_label_field in label_fields:
+            default_field = saved_label_field
+        if _is_applying_export_settings(format_choice):
+            if saved_label_field in label_fields:
+                st.session_state["export_label_field"] = saved_label_field
+            else:
+                st.session_state.pop("export_label_field", None)
+        elif st.session_state.get("export_label_field") not in (None, *label_fields):
+            st.session_state.pop("export_label_field", None)
         default_idx = label_fields.index(default_field) if default_field in label_fields else 0
         label_field = st.selectbox(label_field_label, label_fields, index=default_idx, key="export_label_field")
 
         all_classes = _cached_label_classes(ds, label_field)
         if all_classes and format_choice != "YOLO 混合训练（pose）":
-            selected_classes = st.multiselect("选择导出类别（留空导出全部）", all_classes, key="export_classes")
+            default_classes = _filter_existing(saved_settings.get("classes", []), all_classes)
+            if _is_applying_export_settings(format_choice):
+                st.session_state["export_classes"] = default_classes
+            elif "export_classes" in st.session_state:
+                st.session_state["export_classes"] = _filter_existing(st.session_state["export_classes"], all_classes)
+            selected_classes = st.multiselect(
+                "选择导出类别（留空导出全部）",
+                all_classes,
+                default=default_classes,
+                key="export_classes",
+            )
 
         with st.expander("🔒 类别顺序锁定（增量训练推荐）", expanded=False):
             st.caption("选择上一版 data.yaml 后，旧类别 class id 保持不变，新类别追加到末尾。")
@@ -185,21 +293,36 @@ def _render_dataset_export(ds):
                     st.warning("未能从该 YAML 读取类别顺序，将使用当前导出类别顺序")
 
         if format_choice == "YOLO Pose (关键点)":
-            kp_field = st.text_input("关键点字段名", value=f"{label_field}_keypoints", key="export_kp_field")
+            kp_field = st.text_input(
+                "关键点字段名",
+                value=saved_settings.get("kp_field") or f"{label_field}_keypoints",
+                key="export_kp_field",
+            )
 
         if format_choice == "YOLO 混合训练（pose）":
             st.markdown("**混合训练参数**")
             detection_fields = [f for f in label_fields if dm.get_field_label_type(ds, f) == "detections"]
+            mixed_det_options = detection_fields or label_fields
+            saved_mixed_det_field = saved_settings.get("mixed_det_field") or "ground_truth"
+            if _is_applying_export_settings(format_choice):
+                if saved_mixed_det_field in mixed_det_options:
+                    st.session_state["export_mixed_det_field"] = saved_mixed_det_field
+                else:
+                    st.session_state.pop("export_mixed_det_field", None)
+            elif st.session_state.get("export_mixed_det_field") not in (None, *mixed_det_options):
+                st.session_state.pop("export_mixed_det_field", None)
             mixed_det_field = st.selectbox(
                 "检测框字段",
-                detection_fields or label_fields,
-                index=(detection_fields or label_fields).index("ground_truth")
-                if "ground_truth" in (detection_fields or label_fields) else 0,
+                mixed_det_options,
+                index=_select_index(
+                    mixed_det_options,
+                    saved_mixed_det_field,
+                ),
                 key="export_mixed_det_field",
             )
             det_text = st.text_input(
                 "只检测类别（逗号分隔）",
-                value="pallet",
+                value=", ".join(saved_settings.get("mixed_detection_classes") or ["pallet"]),
                 key="export_mixed_detection_classes",
                 help="这些类别会使用检测框导出，关键点全部写为 0。例如 pallet。",
             )
@@ -208,12 +331,12 @@ def _render_dataset_export(ds):
             col_e, col_m = st.columns(2)
             with col_e:
                 edge_threshold = st.number_input(
-                    "边界阈值 (像素)", 0.0, 100.0, 5.0, 1.0,
+                    "边界阈值 (像素)", 0.0, 100.0, float(saved_settings.get("edge_threshold", 5.0)), 1.0,
                     key="export_mixed_edge_threshold",
                 )
             with col_m:
                 bbox_margin = st.number_input(
-                    "BBox 外扩边距 (归一化)", 0.0, 0.2, 0.0, 0.005,
+                    "BBox 外扩边距 (归一化)", 0.0, 0.2, float(saved_settings.get("bbox_margin", 0.0)), 0.005,
                     key="export_mixed_bbox_margin",
                 )
             pose_classes = all_classes
@@ -221,9 +344,17 @@ def _render_dataset_export(ds):
             det_classes = [c for c in det_all_classes if not mixed_detection_classes or c in mixed_detection_classes]
             combined_classes = sorted(set(pose_classes + det_classes))
             if combined_classes:
+                default_mixed_classes = _filter_existing(saved_settings.get("classes", []), combined_classes)
+                if _is_applying_export_settings(format_choice):
+                    st.session_state["export_mixed_classes"] = default_mixed_classes
+                elif "export_mixed_classes" in st.session_state:
+                    st.session_state["export_mixed_classes"] = _filter_existing(
+                        st.session_state["export_mixed_classes"], combined_classes,
+                    )
                 selected_classes = st.multiselect(
                     "选择导出类别（留空导出全部）",
                     combined_classes,
+                    default=default_mixed_classes,
                     key="export_mixed_classes",
                 )
 
@@ -231,15 +362,27 @@ def _render_dataset_export(ds):
             st.markdown("**可见性参数**")
             col_e, col_m = st.columns(2)
             with col_e:
-                edge_threshold = st.number_input("边界阈值 (像素)", 0.0, 100.0, 5.0, 1.0, key="export_edge_threshold")
+                edge_threshold = st.number_input(
+                    "边界阈值 (像素)", 0.0, 100.0, float(saved_settings.get("edge_threshold", 5.0)), 1.0,
+                    key="export_edge_threshold",
+                )
             with col_m:
-                bbox_margin = st.number_input("BBox 外扩边距 (归一化)", 0.0, 0.2, 0.0, 0.005, key="export_bbox_margin")
+                bbox_margin = st.number_input(
+                    "BBox 外扩边距 (归一化)", 0.0, 0.2, float(saved_settings.get("bbox_margin", 0.0)), 0.005,
+                    key="export_bbox_margin",
+                )
 
         if format_choice == "YOLO OBB (旋转框)":
-            obb_field = st.text_input("OBB 字段名（Polylines, 可选）", key="export_obb_field")
+            obb_field = st.text_input(
+                "OBB 字段名（Polylines, 可选）",
+                value=saved_settings.get("obb_field", ""),
+                key="export_obb_field",
+            )
 
         if isinstance(splits, dict) and split_mode == "按比例自动划分" and total_pct != 100:
             can_export = False
+
+    st.session_state.pop(_EXPORT_PENDING_APPLY_KEY, None)
 
     disabled_reason = ""
     if not output_dir:
@@ -293,7 +436,6 @@ def _render_dataset_export(ds):
                     return
 
                 classes = selected_classes or None
-
                 if format_choice == "YOLO Detect (纯框)":
                     result = exporter.export_yolo_detect(
                         export_view, output_dir, label_field=label_field, classes=classes, splits=splits,
@@ -335,6 +477,29 @@ def _render_dataset_export(ds):
                     )
                 else:
                     result = {}
+
+                _save_export_format_settings(
+                    ds,
+                    format_choice,
+                    {
+                        "tags_filter": selected_tags,
+                        "include_background_train": include_background_train,
+                        "split_mode": split_mode,
+                        "train_pct": st.session_state.get("split_train_pct", 80),
+                        "valid_pct": st.session_state.get("split_valid_pct", 10),
+                        "test_pct": st.session_state.get("split_test_pct", 10),
+                        "single_split": st.session_state.get("export_split", "train"),
+                        "label_field": label_field,
+                        "classes": selected_classes,
+                        "class_order_yaml": class_order_yaml,
+                        "kp_field": kp_field,
+                        "mixed_det_field": mixed_det_field,
+                        "mixed_detection_classes": mixed_detection_classes,
+                        "edge_threshold": edge_threshold,
+                        "bbox_margin": bbox_margin,
+                        "obb_field": obb_field,
+                    },
+                )
 
                 st.success("✅ 导出完成")
                 st.json(result)

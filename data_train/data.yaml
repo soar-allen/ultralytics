@@ -1,0 +1,16 @@
+flip_idx:
+- 1
+- 0
+- 3
+- 2
+kpt_shape:
+- 4
+- 3
+names:
+  0: chuan
+  1: tian
+nc: 2
+path: /home/cotek/ws_cotek/ultralytics/data_train
+test: test/images
+train: train/images
+val: val/images
