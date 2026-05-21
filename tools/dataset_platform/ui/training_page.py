@@ -35,9 +35,13 @@ def _render_training_page():
         st.info("请先选择数据集")
         return
 
+    training_sections = ["🚀 训练配置与启动", "📊 训练进度与历史", "🔮 通用预测", "🔄 训练后回灌"]
+    if st.session_state.get("training_section") not in (None, *training_sections):
+        del st.session_state["training_section"]
+
     section = st.radio(
         "训练模块",
-        ["🚀 训练配置与启动", "📊 训练进度与历史", "🔁 模型格式转换", "🔮 通用预测", "🔄 训练后回灌"],
+        training_sections,
         key="training_section",
         horizontal=True,
         label_visibility="collapsed",
@@ -47,8 +51,6 @@ def _render_training_page():
         _render_train_config(ds)
     elif section.startswith("📊"):
         _render_progress_and_history(ds)
-    elif section.startswith("🔁"):
-        _render_model_export(ds)
     elif section.startswith("🔮"):
         _render_predict(ds)
     else:
@@ -674,8 +676,8 @@ def _parse_imgsz_text(value: str) -> int | list[int]:
 
 
 def _render_model_export(ds):
-    st.subheader("模型格式转换")
-    st.caption("参数与根目录 export.py 保持一致，转换结果由 Ultralytics 保存到默认导出位置。")
+    st.subheader("模型导出")
+    st.caption("参数与根目录 export.py 保持一致，导出结果由 Ultralytics 保存到默认导出位置。")
 
     last_best = ds.info.get("last_best_pt", "")
     history = trainer.get_training_history(ds)
@@ -782,7 +784,7 @@ def _render_model_export(ds):
         with col_d:
             optimize = st.checkbox("optimize", value=False, key="model_export_optimize")
 
-    if st.button("🔁 开始转换", key="btn_model_export", type="primary"):
+    if st.button("🔁 开始导出", key="btn_model_export", type="primary"):
         if not weights:
             st.error("请指定模型权重")
             return
@@ -792,7 +794,7 @@ def _render_model_export(ds):
             st.error(str(e))
             return
 
-        with st.spinner("模型格式转换中..."):
+        with st.spinner("模型导出中..."):
             try:
                 record = trainer.export_model_format(
                     weights=weights,
@@ -814,19 +816,19 @@ def _render_model_export(ds):
                     ds=ds,
                 )
             except Exception as e:
-                st.error(f"转换失败: {e}")
+                st.error(f"导出失败: {e}")
                 return
 
-        st.success("✅ 转换完成")
+        st.success("✅ 导出完成")
         st.info(f"输出路径: `{record.get('output_path')}`")
-        with st.expander("转换记录", expanded=False):
+        with st.expander("导出记录", expanded=False):
             st.json(record)
 
     st.markdown("---")
-    st.markdown("### 📜 转换历史")
+    st.markdown("### 📜 模型导出历史")
     export_history = ds.info.get("model_export_history", [])
     if not export_history:
-        st.info("暂无模型格式转换记录。")
+        st.info("暂无模型导出记录。")
         return
 
     import pandas as pd

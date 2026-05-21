@@ -62,9 +62,13 @@ def _render_dataset_annotation():
 
 def _render_export_and_training():
     """Render export and training as one workflow page."""
+    sections = ["📤 数据导出", "🏋️ 训练与模型"]
+    if st.session_state.get("export_train_section") not in (None, *sections):
+        del st.session_state["export_train_section"]
+
     section = st.radio(
         "模型训练与导出模块",
-        ["📤 数据交付", "🏋️ 训练与模型"],
+        sections,
         key="export_train_section",
         horizontal=True,
         label_visibility="collapsed",

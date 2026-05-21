@@ -1,4 +1,4 @@
-"""数据导出页面：多格式 YOLO 导出 + 自动衔接训练。"""
+"""数据导出页面：数据集导出、模型导出。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,11 +21,35 @@ from tools.dataset_platform.ui.components import (
 
 
 def _render_export():
-    st.header("📤 多格式导出")
+    st.header("📤 数据导出")
     ds = _get_ds()
     if ds is None:
         st.info("请先选择数据集")
         return
+
+    export_sections = ["📦 数据集导出", "🔁 模型导出"]
+    if st.session_state.get("data_export_section") not in (None, *export_sections):
+        del st.session_state["data_export_section"]
+
+    section = st.radio(
+        "数据导出模块",
+        export_sections,
+        key="data_export_section",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if section.startswith("🔁"):
+        from tools.dataset_platform.ui.training_page import _render_model_export
+
+        _render_model_export(ds)
+        return
+
+    _render_dataset_export(ds)
+
+
+def _render_dataset_export(ds):
+    st.subheader("数据集导出")
 
     format_choice = st.selectbox(
         "导出格式",
