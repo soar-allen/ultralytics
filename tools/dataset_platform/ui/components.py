@@ -1,6 +1,5 @@
 """公共 UI 组件：路径浏览器、状态管理、per-rerun 缓存。"""
 from __future__ import annotations
-import os
 from pathlib import Path
 from typing import Callable
 import streamlit as st
@@ -331,8 +330,7 @@ def _open_native_dialog(
 ) -> str | None:
     """
     打开系统原生文件对话框。
-    Linux: zenity (原生 GTK) → tkinter
-    Windows/macOS: tkinter → zenity
+    Linux 优先使用 zenity，否则 tkinter。用户取消选择时不再 fallback 到另一个对话框。
     """
     # normalize alias values
     if mode == "directory":
@@ -340,18 +338,11 @@ def _open_native_dialog(
 
     if sys.platform == "linux":
         if shutil.which("zenity"):
-            result = _zenity_dialog(mode, title, start_dir, file_extensions)
-            if result is not None:
-                return result
+            return _zenity_dialog(mode, title, start_dir, file_extensions)
         return _tkinter_dialog(mode, title, start_dir, file_extensions)
 
-    # Windows / macOS: tkinter 优先
-    result = _tkinter_dialog(mode, title, start_dir, file_extensions)
-    if result is not None:
-        return result
-    if shutil.which("zenity"):
-        return _zenity_dialog(mode, title, start_dir, file_extensions)
-    return None
+    # Windows / macOS: tkinter only. A cancel should simply return None.
+    return _tkinter_dialog(mode, title, start_dir, file_extensions)
 
 
 def _tkinter_dialog(
@@ -430,9 +421,7 @@ def _path_browser(
     """
     路径浏览器组件。
 
-    优先使用系统原生文件对话框（tkinter/zenity），
-    同时保留手动输入和 Web 端备用浏览器。
-    Web 浏览器中 selectbox 选择即触发（无需额外点击按钮）。
+    使用系统原生文件对话框（tkinter/zenity），并保留手动输入。
 
     Args:
         label: 显示标签
@@ -450,11 +439,8 @@ def _path_browser(
         mode = "dir"
 
     input_key = f"{key}_input"
-    pending_key = f"{key}_pending"
 
-    if pending_key in st.session_state:
-        st.session_state[input_key] = st.session_state.pop(pending_key)
-    elif input_key not in st.session_state and default_value:
+    if input_key not in st.session_state and default_value:
         st.session_state[input_key] = default_value
 
     current_val = st.session_state.get(input_key, "")
@@ -484,132 +470,5 @@ def _path_browser(
         if chosen:
             st.session_state[input_key] = chosen
             current_val = chosen
-        else:
-            # 原生对话框不可用或用户取消 → 展开 Web 浏览器
-            st.session_state[f"{key}_show_fallback"] = True
-
-    # --- Web 备用浏览器 ---
-    if st.session_state.get(f"{key}_show_fallback", False):
-        _web_path_browser(key, mode, start_dir, file_extensions, pending_key)
 
     return path_val
-
-
-def _web_path_browser(
-    key: str,
-    mode: str,
-    start_dir: str,
-    file_extensions: tuple | None,
-    pending_key: str,
-):
-    """
-    纯 Web selectbox 备用路径浏览器。
-    选择即触发：选中目录自动进入，选中文件自动确认。
-    """
-    browse_key = f"{key}_cwd"
-    nav_key = f"{key}_nav_seq"
-
-    # normalize alias values (accept 'directory' as synonym for 'dir')
-    if mode == "directory":
-        mode = "dir"
-
-    if browse_key not in st.session_state:
-        st.session_state[browse_key] = (
-            start_dir if start_dir and Path(start_dir).is_dir()
-            else str(Path.home())
-        )
-    if nav_key not in st.session_state:
-        st.session_state[nav_key] = 0
-
-    def _navigate(new_dir: str):
-        st.session_state[browse_key] = new_dir
-        st.session_state[nav_key] += 1
-        st.rerun()
-
-    with st.expander("📂 Web 文件浏览器", expanded=True):
-        current_dir = st.session_state[browse_key]
-        seq = st.session_state[nav_key]
-
-        # --- 路径栏 + 上级 ---
-        col_path, col_up = st.columns([6, 1])
-        with col_path:
-            typed_dir = st.text_input(
-                "当前目录", value=current_dir, key=f"{key}_path_{seq}",
-            )
-        with col_up:
-            st.write("")
-            if st.button("⬆️", key=f"{key}_up_{seq}", help="上级目录"):
-                _navigate(str(Path(current_dir).parent))
-
-        if typed_dir != current_dir and Path(typed_dir).is_dir():
-            _navigate(typed_dir)
-
-        if not Path(current_dir).is_dir():
-            st.warning(f"目录不存在: {current_dir}")
-            return
-
-        # --- 选择当前目录（dir 模式，置顶显示） ---
-        if mode == "dir":
-            if st.button("✅ 选择当前目录", key=f"{key}_pickc_{seq}",
-                         type="primary", use_container_width=True):
-                st.session_state[pending_key] = current_dir
-                st.rerun()
-
-        # --- 列出内容 ---
-        try:
-            entries = sorted(
-                os.scandir(current_dir),
-                key=lambda e: (not e.is_dir(), e.name.lower()),
-            )
-        except PermissionError:
-            st.error("无权限访问该目录")
-            return
-
-        dirs: list[str] = []
-        files: list[str] = []
-        for entry in entries:
-            if entry.name.startswith("."):
-                continue
-            try:
-                is_dir = entry.is_dir(follow_symlinks=False)
-            except OSError:
-                continue
-            if is_dir:
-                dirs.append(entry.name)
-            elif mode == "file" and entry.is_file(follow_symlinks=False):
-                if file_extensions:
-                    if Path(entry.name).suffix.lower() in file_extensions:
-                        files.append(entry.name)
-                else:
-                    files.append(entry.name)
-
-        # --- 目录列表：选择即进入 ---
-        if dirs:
-            placeholder = "— 点击选择子目录（自动进入）—"
-            options = [placeholder] + dirs
-            chosen = st.selectbox(
-                f"📁 子目录 ({len(dirs)})", options,
-                key=f"{key}_dsel_{seq}",
-            )
-            if chosen != placeholder:
-                _navigate(os.path.join(current_dir, chosen))
-
-        # --- 文件列表：选择即确认 ---
-        if mode == "file":
-            if files:
-                placeholder_f = "— 点击选择文件（自动确认）—"
-                options_f = [placeholder_f] + files
-                chosen_f = st.selectbox(
-                    f"📄 文件 ({len(files)})", options_f,
-                    key=f"{key}_fsel_{seq}",
-                )
-                if chosen_f != placeholder_f:
-                    st.session_state[pending_key] = os.path.join(
-                        current_dir, chosen_f,
-                    )
-                    st.rerun()
-            else:
-                ext_hint = (
-                    ", ".join(file_extensions) if file_extensions else "所有文件"
-                )
-                st.caption(f"当前目录无匹配文件 ({ext_hint})")
