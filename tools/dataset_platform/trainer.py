@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import logging
 import math
 import random
@@ -24,6 +25,29 @@ import fiftyone as fo
 import yaml
 
 logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DATA_TRAIN_DIR = _PROJECT_ROOT / "data_train"
+_RKNN_CALIBRATION_TXT = _DATA_TRAIN_DIR / "rknn_calibration.txt"
+_RKNN_CALIBRATION_IMAGE_DIR = _DATA_TRAIN_DIR / "rknn_calibration_images"
+_RKNN_MAX_CALIBRATION_IMAGES = 256
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+_RKNN_DTYPES = {"i8", "u8", "fp"}
+_RKNN_PLATFORMS = {
+    "rk3562",
+    "rk3566",
+    "rk3568",
+    "rk3576",
+    "rk3588",
+    "rv1126b",
+    "rv1109",
+    "rv1126",
+    "rk1808",
+    "rv1103",
+    "rv1106",
+    "rv1103b",
+    "rv1106b",
+    "rk2118",
+}
 
 _training_thread: Optional[threading.Thread] = None
 _training_status: dict = {
@@ -668,6 +692,186 @@ SUPPORTED_EXPORT_FORMATS = [
 SUPPORTED_EXPORT_TASKS = ["detect", "segment", "classify", "pose", "obb"]
 
 
+def _record_model_export(ds: Optional[fo.Dataset], record: dict) -> None:
+    if ds is None:
+        return
+    history = ds.info.get("model_export_history", [])
+    history.append(record)
+    ds.info["model_export_history"] = history
+    ds.save()
+
+
+def _load_rknn_converter():
+    convert_path = _PROJECT_ROOT / "convert.py"
+    if not convert_path.exists():
+        raise FileNotFoundError(f"RKNN 转换脚本不存在: {convert_path}")
+    spec = importlib.util.spec_from_file_location("dataset_platform_rknn_convert", convert_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 RKNN 转换脚本: {convert_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.convert_onnx_to_rknn
+
+
+def _collect_rknn_calibration_images() -> list[Path]:
+    roots = [
+        _DATA_TRAIN_DIR / "val" / "images",
+        _DATA_TRAIN_DIR / "train" / "images",
+    ]
+    images: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix.lower() in _IMAGE_EXTS:
+                resolved = str(path.resolve())
+                if resolved not in seen:
+                    images.append(path.resolve())
+                    seen.add(resolved)
+    return images
+
+
+def _write_rknn_calibration_txt() -> Path:
+    images = _collect_rknn_calibration_images()
+    if not images:
+        raise FileNotFoundError("data_train 下没有可用于 RKNN 量化校准的图片，请先导出数据集")
+    images = images[:_RKNN_MAX_CALIBRATION_IMAGES]
+    _RKNN_CALIBRATION_TXT.parent.mkdir(parents=True, exist_ok=True)
+    _RKNN_CALIBRATION_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in _RKNN_CALIBRATION_IMAGE_DIR.iterdir():
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+
+    safe_paths = []
+    for idx, image_path in enumerate(images):
+        safe_path = _RKNN_CALIBRATION_IMAGE_DIR / f"calib_{idx:06d}{image_path.suffix.lower()}"
+        try:
+            safe_path.symlink_to(image_path)
+        except OSError:
+            import shutil
+
+            shutil.copy2(image_path, safe_path)
+        safe_paths.append(safe_path)
+
+    _RKNN_CALIBRATION_TXT.write_text("\n".join(str(p) for p in safe_paths) + "\n", encoding="utf-8")
+    return _RKNN_CALIBRATION_TXT
+
+
+def _export_onnx_for_rknn(
+    weights: str,
+    task: str | None,
+    imgsz: int | list[int],
+    device: str,
+    batch: int,
+    opset: int | None,
+    half: bool,
+    dynamic: bool,
+    simplify: bool,
+    nms: bool,
+) -> Path:
+    weights_path = Path(weights)
+    if weights_path.suffix.lower() == ".onnx":
+        if not weights_path.exists():
+            raise FileNotFoundError(f"ONNX 模型不存在: {weights}")
+        return weights_path.resolve()
+
+    from ultralytics import YOLO
+
+    model = YOLO(weights, task=task)
+    export_kwargs = dict(
+        format="onnx",
+        imgsz=imgsz,
+        batch=batch,
+        half=half,
+        dynamic=dynamic,
+        simplify=simplify,
+        nms=nms,
+    )
+    if device is not None:
+        export_kwargs["device"] = int(device) if str(device).isdigit() else device
+    if opset is not None:
+        export_kwargs["opset"] = int(opset)
+    return Path(model.export(**export_kwargs)).resolve()
+
+
+def _export_rknn_model_format(
+    weights: str,
+    task: str | None,
+    imgsz: int | list[int],
+    device: str,
+    batch: int,
+    opset: int | None,
+    half: bool,
+    dynamic: bool,
+    simplify: bool,
+    nms: bool,
+    rknn_platform: str,
+    rknn_dtype: str,
+    ds: Optional[fo.Dataset],
+) -> dict:
+    rknn_platform = (rknn_platform or "rk3588").lower()
+    rknn_dtype = (rknn_dtype or "i8").lower()
+    if rknn_platform not in _RKNN_PLATFORMS:
+        raise ValueError(f"不支持的 RKNN 芯片平台: {rknn_platform}")
+    if rknn_dtype not in _RKNN_DTYPES:
+        raise ValueError(f"不支持的 RKNN dtype: {rknn_dtype}")
+
+    start = time.time()
+    onnx_path = _export_onnx_for_rknn(
+        weights=weights,
+        task=task,
+        imgsz=imgsz,
+        device=device,
+        batch=batch,
+        opset=opset,
+        half=half,
+        dynamic=dynamic,
+        simplify=simplify,
+        nms=nms,
+    )
+    calibration_txt = _write_rknn_calibration_txt() if rknn_dtype in {"i8", "u8"} else None
+    output_dir = onnx_path.with_name(f"{onnx_path.stem}_rknn_model")
+    output_path = output_dir / f"{onnx_path.stem}-{rknn_platform}-{rknn_dtype}.rknn"
+    converter = _load_rknn_converter()
+    rknn_path = converter(
+        onnx_model_path=onnx_path,
+        platform=rknn_platform,
+        dtype=rknn_dtype,
+        output_rknn_path=output_path,
+        dataset_path=calibration_txt,
+    )
+    end = time.time()
+    record = {
+        "timestamp": datetime.fromtimestamp(start).isoformat(),
+        "end_time": datetime.fromtimestamp(end).isoformat(),
+        "duration_seconds": round(end - start, 1),
+        "weights": weights,
+        "task": task,
+        "format": "rknn",
+        "imgsz": imgsz,
+        "batch": batch,
+        "device": device,
+        "opset": opset,
+        "half": half,
+        "int8": rknn_dtype in {"i8", "u8"},
+        "dynamic": dynamic,
+        "simplify": simplify,
+        "nms": nms,
+        "workspace": None,
+        "fraction": 1.0,
+        "keras": False,
+        "optimize": False,
+        "onnx_path": str(onnx_path),
+        "rknn_platform": rknn_platform,
+        "rknn_dtype": rknn_dtype,
+        "calibration_dataset": str(calibration_txt) if calibration_txt else None,
+        "output_path": str(rknn_path),
+    }
+    _record_model_export(ds, record)
+    return record
+
+
 def export_model_format(
     weights: str,
     task: str | None = None,
@@ -685,6 +889,8 @@ def export_model_format(
     fraction: float = 1.0,
     keras: bool = False,
     optimize: bool = False,
+    rknn_platform: str = "rk3588",
+    rknn_dtype: str = "i8",
     ds: Optional[fo.Dataset] = None,
 ) -> dict:
     """按根目录 export.py 的参数语义转换 YOLO 模型格式。"""
@@ -694,9 +900,32 @@ def export_model_format(
         raise ValueError(f"不支持的任务类型: {task}")
     if not weights:
         raise ValueError("请指定模型权重")
-    looks_like_path = Path(weights).is_absolute() or "/" in weights or "\\" in weights
-    if looks_like_path and weights.endswith((".pt", ".pth", ".yaml")) and not Path(weights).exists():
+    weights_path = Path(weights)
+    looks_like_path = weights_path.is_absolute() or "/" in weights or "\\" in weights
+    if (looks_like_path or weights_path.suffix.lower() == ".onnx") and weights_path.suffix.lower() in {
+        ".pt",
+        ".pth",
+        ".yaml",
+        ".onnx",
+    } and not weights_path.exists():
         raise FileNotFoundError(f"模型权重不存在: {weights}")
+
+    if export_format == "rknn":
+        return _export_rknn_model_format(
+            weights=weights,
+            task=task,
+            imgsz=imgsz,
+            device=device,
+            batch=batch,
+            opset=opset,
+            half=half,
+            dynamic=dynamic,
+            simplify=simplify,
+            nms=nms,
+            rknn_platform=rknn_platform,
+            rknn_dtype=rknn_dtype,
+            ds=ds,
+        )
 
     from ultralytics import YOLO
 
@@ -746,11 +975,7 @@ def export_model_format(
         "optimize": optimize,
         "output_path": str(output_path),
     }
-    if ds is not None:
-        history = ds.info.get("model_export_history", [])
-        history.append(record)
-        ds.info["model_export_history"] = history
-        ds.save()
+    _record_model_export(ds, record)
     return record
 
 

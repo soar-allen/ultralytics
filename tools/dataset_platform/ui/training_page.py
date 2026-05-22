@@ -772,8 +772,8 @@ def _render_model_export(ds):
             st.warning("暂无历史权重记录")
     elif model_source == "自定义路径":
         weights = _path_browser(
-            "模型权重 (.pt)", "model_export_weight_path", mode="file",
-            file_extensions=(".pt", ".pth", ".yaml"),
+            "模型权重 (.pt/.onnx)", "model_export_weight_path", mode="file",
+            file_extensions=(".pt", ".pth", ".yaml", ".onnx"),
             start_dir=str(Path(last_best).parent) if last_best and Path(last_best).parent.exists() else "",
         )
     else:
@@ -792,6 +792,7 @@ def _render_model_export(ds):
             index=trainer.SUPPORTED_EXPORT_FORMATS.index("onnx"),
             key="model_export_format",
         )
+    is_rknn_export = export_format == "rknn"
     with col_task:
         export_task = st.selectbox(
             "任务类型",
@@ -820,23 +821,57 @@ def _render_model_export(ds):
             key="model_export_opset",
         )
     with col_ws:
-        workspace_value = st.number_input(
-            "TensorRT Workspace GB (0=自动)",
-            0.0, 128.0, 0.0, 0.5,
-            key="model_export_workspace",
-        )
+        if is_rknn_export:
+            rknn_platform = st.selectbox(
+                "RKNN 芯片",
+                [
+                    "rk3588",
+                    "rk3576",
+                    "rk3568",
+                    "rk3566",
+                    "rk3562",
+                    "rv1126b",
+                    "rv1109",
+                    "rv1126",
+                    "rk1808",
+                    "rv1103",
+                    "rv1106",
+                    "rv1103b",
+                    "rv1106b",
+                    "rk2118",
+                ],
+                key="model_export_rknn_platform",
+            )
+            workspace_value = 0.0
+        else:
+            workspace_value = st.number_input(
+                "TensorRT Workspace GB (0=自动)",
+                0.0, 128.0, 0.0, 0.5,
+                key="model_export_workspace",
+            )
+            rknn_platform = "rk3588"
     with col_frac:
-        fraction = st.number_input(
-            "INT8 校准数据比例",
-            0.01, 1.0, 1.0, 0.05,
-            key="model_export_fraction",
-        )
+        if is_rknn_export:
+            rknn_dtype = st.selectbox(
+                "RKNN dtype",
+                ["i8", "fp", "u8"],
+                key="model_export_rknn_dtype",
+                help="i8/u8 会使用 data_train 自动生成校准图片列表；fp 不量化。",
+            )
+            fraction = 1.0
+        else:
+            fraction = st.number_input(
+                "INT8 校准数据比例",
+                0.01, 1.0, 1.0, 0.05,
+                key="model_export_fraction",
+            )
+            rknn_dtype = "i8"
 
     with st.expander("高级导出选项", expanded=False):
         col_a, col_b2, col_c, col_d = st.columns(4)
         with col_a:
             half = st.checkbox("half (FP16)", value=False, key="model_export_half")
-            int8 = st.checkbox("int8", value=False, key="model_export_int8")
+            int8 = st.checkbox("int8", value=False, key="model_export_int8", disabled=is_rknn_export)
         with col_b2:
             dynamic = st.checkbox("dynamic", value=False, key="model_export_dynamic")
             simplify = st.checkbox("simplify", value=False, key="model_export_simplify")
@@ -875,6 +910,8 @@ def _render_model_export(ds):
                     fraction=float(fraction),
                     keras=keras,
                     optimize=optimize,
+                    rknn_platform=rknn_platform,
+                    rknn_dtype=rknn_dtype,
                     ds=ds,
                 )
             except Exception as e:

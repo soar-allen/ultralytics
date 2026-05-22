@@ -439,9 +439,12 @@ def _path_browser(
         mode = "dir"
 
     input_key = f"{key}_input"
+    pending_key = f"{key}_pending_path"
 
     if input_key not in st.session_state and default_value:
         st.session_state[input_key] = default_value
+    if pending_key in st.session_state:
+        st.session_state[input_key] = st.session_state.pop(pending_key)
 
     current_val = st.session_state.get(input_key, "")
 
@@ -468,7 +471,7 @@ def _path_browser(
             start_dir=initial, file_extensions=file_extensions,
         )
         if chosen:
-            st.session_state[input_key] = chosen
-            current_val = chosen
+            st.session_state[pending_key] = chosen
+            st.rerun()
 
     return path_val
